@@ -1,4 +1,4 @@
-use self::model::{INDICES, NORMALS, Normal, POSITIONS, Position};
+use self::model::{Normal, Position, generate_cube_mesh};
 use glam::{Mat4, f32::Vec3};
 use std::{error::Error, sync::Arc};
 use vulkano::{
@@ -175,6 +175,14 @@ impl App {
             Default::default(),
         ));
 
+        let cube_centers: Vec<Vec3> = dot_vox::load("assets/tall_building.vox").unwrap().models[0]
+            .voxels
+            .iter()
+            .map(|v| Vec3::new(v.x as f32, v.y as f32, v.z as f32))
+            .collect();
+
+        let (positions, normals, indices) = generate_cube_mesh(&cube_centers);
+
         let vertex_buffer = Buffer::from_iter(
             memory_allocator.clone(),
             BufferCreateInfo {
@@ -186,7 +194,7 @@ impl App {
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
             },
-            POSITIONS,
+            positions,
         )
         .unwrap();
         let normals_buffer = Buffer::from_iter(
@@ -200,7 +208,7 @@ impl App {
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
             },
-            NORMALS,
+            normals,
         )
         .unwrap();
         let index_buffer = Buffer::from_iter(
@@ -214,7 +222,7 @@ impl App {
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
             },
-            INDICES,
+            indices, // Use generated indices
         )
         .unwrap();
 
@@ -240,7 +248,7 @@ impl App {
             index_buffer,
             uniform_buffer_allocator,
             rcx: None,
-            camera_position: Vec3::new(0.0, 1.0, 0.0),
+            camera_position: Vec3::new(0.0, 0.0, 0.0),
             yaw: -std::f32::consts::FRAC_PI_2,
             pitch: 0.0,
             is_focused: false,
@@ -378,7 +386,10 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        let rcx = self.rcx.as_mut().unwrap();
+        let rcx = match self.rcx.as_mut() {
+            Some(rcx) => rcx,
+            None => return,
+        };
 
         match event {
             WindowEvent::CloseRequested => {
@@ -391,14 +402,36 @@ impl ApplicationHandler for App {
                     PhysicalKey::Code(KeyCode::KeyS) => self.is_moving_backward = is_pressed,
                     PhysicalKey::Code(KeyCode::KeyA) => self.is_moving_left = is_pressed,
                     PhysicalKey::Code(KeyCode::KeyD) => self.is_moving_right = is_pressed,
-                    PhysicalKey::Code(KeyCode::Space) => self.is_moving_up = is_pressed, // Or up, depending on preference
-                    PhysicalKey::Code(KeyCode::ShiftLeft) => self.is_moving_down = is_pressed, // Or down
+                    PhysicalKey::Code(KeyCode::Space) => self.is_moving_up = is_pressed,
+                    PhysicalKey::Code(KeyCode::ShiftLeft) => self.is_moving_down = is_pressed,
+                    PhysicalKey::Code(KeyCode::Escape) => {
+                        self.is_focused = false;
+                        rcx.window
+                            .set_cursor_grab(winit::window::CursorGrabMode::None)
+                            .unwrap();
+                        rcx.window.set_cursor_visible(true);
+                    }
                     _ => {}
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if state == ElementState::Pressed && button == winit::event::MouseButton::Left {
+                    self.is_focused = true;
+                    rcx.window
+                        .set_cursor_grab(winit::window::CursorGrabMode::Locked)
+                        .unwrap();
+                    rcx.window.set_cursor_visible(false);
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => match delta {
                 winit::event::MouseScrollDelta::LineDelta(_, y) => {
-                    self.camera_position[1] += y / 10.0
+                    let forward = Vec3::new(
+                        self.yaw.cos() * self.pitch.cos(),
+                        self.pitch.sin(),
+                        self.yaw.sin() * self.pitch.cos(),
+                    )
+                    .normalize();
+                    self.camera_position += forward * y * 0.1;
                 }
                 _ => {}
             },
@@ -447,34 +480,30 @@ impl ApplicationHandler for App {
                 }
 
                 let uniform_buffer = {
-                    // NOTE: This teapot was meant for OpenGL where the origin is at the lower left
-                    // instead the origin is at the upper left in Vulkan, so we reverse the Y axis.
                     let aspect_ratio = rcx.swapchain.image_extent()[0] as f32
                         / rcx.swapchain.image_extent()[1] as f32;
 
-                    let proj = Mat4::perspective_rh_gl(
-                        std::f32::consts::FRAC_PI_2,
-                        aspect_ratio,
-                        0.01,
-                        100.0,
-                    );
+                    let proj =
+                        Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, aspect_ratio, 0.1, 100.0);
+
                     let forward = Vec3::new(
                         self.yaw.cos() * self.pitch.cos(),
                         self.pitch.sin(),
                         self.yaw.sin() * self.pitch.cos(),
                     )
                     .normalize();
-                    let view = Mat4::look_at_rh(
-                        self.camera_position,
-                        self.camera_position + forward,
-                        Vec3::Y,
-                    );
-                    let scale = Mat4::from_scale(Vec3::splat(0.01));
+                    let right = Vec3::Y.cross(forward).normalize();
+                    let up = forward.cross(right).normalize();
+
+                    let view =
+                        Mat4::look_at_rh(self.camera_position, self.camera_position + forward, up);
+                    let sun = Vec3::new(0.48, 0.98, 0.78);
 
                     let uniform_data = vs::Data {
                         world: Mat4::IDENTITY.to_cols_array_2d(),
-                        view: (view * scale).to_cols_array_2d(),
+                        view: view.to_cols_array_2d(),
                         proj: proj.to_cols_array_2d(),
+                        sun: sun.normalize().to_array(),
                     };
 
                     let buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
@@ -594,35 +623,39 @@ impl ApplicationHandler for App {
             self.yaw.sin() * self.pitch.cos(),
         )
         .normalize();
-        let right = forward.cross(Vec3::Y).normalize();
+        let right = -Vec3::Y.cross(forward).normalize();
+        let up = -Vec3::Y;
 
+        let mut move_delta = Vec3::ZERO;
         if self.is_moving_forward {
-            self.camera_position += forward * MOVE_SPEED;
+            move_delta += forward;
         }
         if self.is_moving_backward {
-            self.camera_position -= forward * MOVE_SPEED;
+            move_delta -= forward;
         }
         if self.is_moving_right {
-            self.camera_position += right * MOVE_SPEED;
+            move_delta += right;
         }
         if self.is_moving_left {
-            self.camera_position -= right * MOVE_SPEED;
-        }
-        if self.is_moving_down {
-            self.camera_position += Vec3::Y * MOVE_SPEED;
+            move_delta -= right;
         }
         if self.is_moving_up {
-            self.camera_position -= Vec3::Y * MOVE_SPEED;
+            move_delta += up;
+        }
+        if self.is_moving_down {
+            move_delta -= up;
         }
 
-        // Now request redraw
+        if move_delta != Vec3::ZERO {
+            self.camera_position += move_delta.normalize() * MOVE_SPEED;
+        }
+
         if let Some(rcx) = self.rcx.as_mut() {
             rcx.window.request_redraw();
         }
     }
 }
 
-/// This function is called once during initialization, then again whenever the window is resized.
 fn window_size_dependent_setup(
     window_size: PhysicalSize<u32>,
     images: &[Arc<Image>],
@@ -692,7 +725,7 @@ fn window_size_dependent_setup(
                 viewport_state: Some(ViewportState {
                     viewports: [Viewport {
                         offset: [0.0, 0.0],
-                        extent: window_size.into(),
+                        extent: [window_size.width as f32, window_size.height as f32],
                         depth_range: 0.0..=1.0,
                     }]
                     .into_iter()
@@ -722,13 +755,13 @@ fn window_size_dependent_setup(
 mod vs {
     vulkano_shaders::shader! {
         ty: "vertex",
-        path: "src/vert.glsl",
+        path: "src/shaders/vert.glsl",
     }
 }
 
 mod fs {
     vulkano_shaders::shader! {
         ty: "fragment",
-        path: "src/frag.glsl",
+        path: "src/shaders/frag.glsl",
     }
 }
