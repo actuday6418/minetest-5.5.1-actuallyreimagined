@@ -1,6 +1,12 @@
 use self::model::{Normal, Position, generate_cube_mesh};
 use glam::{Mat4, f32::Vec3};
-use std::{error::Error, sync::Arc};
+use model::TexCoord;
+use std::{
+    error::Error,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use vulkano::{
     Validated, VulkanError, VulkanLibrary,
     buffer::{
@@ -19,7 +25,11 @@ use vulkano::{
         QueueFlags, physical::PhysicalDeviceType,
     },
     format::Format,
-    image::{Image, ImageCreateInfo, ImageType, ImageUsage, view::ImageView},
+    image::{
+        Image, ImageCreateInfo, ImageType, ImageUsage,
+        sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
+        view::ImageView,
+    },
     instance::{Instance, InstanceCreateFlags, InstanceCreateInfo},
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
@@ -74,10 +84,15 @@ struct App {
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     vertex_buffer: Subbuffer<[Position]>,
-    normals_buffer: Subbuffer<[Normal]>,
+    normal_buffer: Subbuffer<[Normal]>,
     index_buffer: Subbuffer<[u32]>,
+    texcoord_buffer: Subbuffer<[TexCoord]>,
+    texture_view: Arc<ImageView>,
+    texture_sampler: Arc<Sampler>,
     uniform_buffer_allocator: SubbufferAllocator,
     rcx: Option<RenderContext>,
+    fps_last_instant: Instant,
+    fps_frame_count: u32,
     camera_position: Vec3,
     yaw: f32,
     pitch: f32,
@@ -186,7 +201,14 @@ impl App {
             .map(|v| Vec3::new(v.x as f32, v.y as f32, v.z as f32))
             .collect();
 
-        let (positions, normals, indices) = generate_cube_mesh(&cube_centers);
+        let image = image::open(Path::new("assets/atlas.png"))
+            .expect("Failed to open texture file")
+            .to_rgba8();
+        let (tex_w, tex_h) = image.dimensions();
+        let image_data = image.into_raw();
+
+        let (positions, normals, tex_coords, indices) =
+            generate_cube_mesh(&cube_centers, tex_w, tex_h);
 
         let vertex_buffer = Buffer::from_iter(
             memory_allocator.clone(),
@@ -202,7 +224,7 @@ impl App {
             positions,
         )
         .unwrap();
-        let normals_buffer = Buffer::from_iter(
+        let normal_buffer = Buffer::from_iter(
             memory_allocator.clone(),
             BufferCreateInfo {
                 usage: BufferUsage::VERTEX_BUFFER,
@@ -214,6 +236,20 @@ impl App {
                 ..Default::default()
             },
             normals,
+        )
+        .unwrap();
+        let texcoord_buffer = Buffer::from_iter(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::VERTEX_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            tex_coords,
         )
         .unwrap();
         let index_buffer = Buffer::from_iter(
@@ -240,16 +276,87 @@ impl App {
                 ..Default::default()
             },
         );
+        let texture_image = Image::new(
+            memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: Format::R8G8B8A8_UNORM,
+                extent: [tex_w, tex_h, 1],
+                usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .unwrap();
+
+        let texture_view = ImageView::new_default(texture_image.clone()).unwrap();
+
+        let texture_sampler = Sampler::new(
+            device.clone(),
+            SamplerCreateInfo {
+                mag_filter: Filter::Nearest,
+                min_filter: Filter::Nearest,
+                mipmap_mode: vulkano::image::sampler::SamplerMipmapMode::Nearest,
+                address_mode: [SamplerAddressMode::Repeat; 3],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let upload_buffer = Buffer::from_iter(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            image_data,
+        )
+        .unwrap();
+
+        let mut upload_cb_builder = AutoCommandBufferBuilder::primary(
+            command_buffer_allocator.clone(),
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap();
+
+        upload_cb_builder
+            .copy_buffer_to_image(
+                vulkano::command_buffer::CopyBufferToImageInfo::buffer_image(
+                    upload_buffer,
+                    texture_image.clone(),
+                ),
+            )
+            .unwrap();
+
+        let upload_cb = upload_cb_builder.build().unwrap();
+
+        let future = sync::now(device.clone())
+            .then_execute(queue.clone(), upload_cb)
+            .unwrap()
+            .then_signal_fence_and_flush()
+            .unwrap();
+        future.wait(None).unwrap();
 
         App {
             instance,
             device,
             queue,
+            fps_last_instant: Instant::now(),
+            fps_frame_count: 0,
             memory_allocator,
             descriptor_set_allocator,
             command_buffer_allocator,
             vertex_buffer,
-            normals_buffer,
+            normal_buffer,
+            texcoord_buffer,
+            texture_view,
+            texture_sampler,
             index_buffer,
             uniform_buffer_allocator,
             rcx: None,
@@ -462,7 +569,16 @@ impl ApplicationHandler for App {
                 }
 
                 rcx.previous_frame_end.as_mut().unwrap().cleanup_finished();
+                self.fps_frame_count += 1;
+                let now = Instant::now();
+                let elapsed = now.duration_since(self.fps_last_instant);
 
+                if elapsed >= Duration::from_secs(1) {
+                    let fps = self.fps_frame_count as f64 / elapsed.as_secs_f64();
+                    println!("FPS: {:.2}", fps); // Print FPS to console
+                    self.fps_frame_count = 0;
+                    self.fps_last_instant = now;
+                }
                 if rcx.recreate_swapchain {
                     let (new_swapchain, new_images) = rcx
                         .swapchain
@@ -502,7 +618,7 @@ impl ApplicationHandler for App {
 
                     let view =
                         Mat4::look_at_rh(self.camera_position, self.camera_position + forward, up);
-                    let sun = Vec3::new(0.48, 0.98, 0.78);
+                    let sun = -Vec3::new(0.48, 0.98, 0.78);
 
                     let uniform_data = vs::Data {
                         world: Mat4::IDENTITY.to_cols_array_2d(),
@@ -521,7 +637,14 @@ impl ApplicationHandler for App {
                 let descriptor_set = DescriptorSet::new(
                     self.descriptor_set_allocator.clone(),
                     layout.clone(),
-                    [WriteDescriptorSet::buffer(0, uniform_buffer)],
+                    [
+                        WriteDescriptorSet::buffer(0, uniform_buffer),
+                        WriteDescriptorSet::image_view_sampler(
+                            1,
+                            self.texture_view.clone(),
+                            self.texture_sampler.clone(),
+                        ),
+                    ],
                     [],
                 )
                 .unwrap();
@@ -576,7 +699,11 @@ impl ApplicationHandler for App {
                     .unwrap()
                     .bind_vertex_buffers(
                         0,
-                        (self.vertex_buffer.clone(), self.normals_buffer.clone()),
+                        (
+                            self.vertex_buffer.clone(),
+                            self.normal_buffer.clone(),
+                            self.texcoord_buffer.clone(),
+                        ),
                     )
                     .unwrap()
                     .bind_index_buffer(self.index_buffer.clone())
@@ -704,9 +831,13 @@ fn window_size_dependent_setup(
         .collect::<Vec<_>>();
 
     let pipeline = {
-        let vertex_input_state = [Position::per_vertex(), Normal::per_vertex()]
-            .definition(vs)
-            .unwrap();
+        let vertex_input_state = [
+            Position::per_vertex(),
+            Normal::per_vertex(),
+            TexCoord::per_vertex(),
+        ]
+        .definition(vs)
+        .unwrap();
         let stages = [
             PipelineShaderStageCreateInfo::new(vs.clone()),
             PipelineShaderStageCreateInfo::new(fs.clone()),
