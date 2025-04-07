@@ -29,7 +29,7 @@ pub struct Normal {
 /// * `Vec<Position>` - The combined vertex positions for all cubes.
 /// * `Vec<Normal>` - The combined vertex normals for all cubes.
 /// * `Vec<u16>` - The combined indices for all cubes.
-pub fn generate_cube_mesh(centers: &[Vec3]) -> (Vec<Position>, Vec<Normal>, Vec<u16>) {
+pub fn generate_cube_mesh(centers: &[Vec3]) -> (Vec<Position>, Vec<Normal>, Vec<u32>) {
     let mut positions = Vec::new();
     let mut normals = Vec::new();
     let mut indices = Vec::new();
@@ -103,12 +103,12 @@ pub fn generate_cube_mesh(centers: &[Vec3]) -> (Vec<Position>, Vec<Normal>, Vec<
         Vec3::new(0.0, -1.0, 0.0),
     ];
 
-    let base_indices: [u16; 36] = [
+    let base_indices: [u32; 36] = [
         0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7, 8, 9, 10, 8, 10, 11, 12, 13, 14, 12, 14, 15, 16, 17,
         18, 16, 18, 19, 20, 21, 22, 20, 22, 23,
     ];
 
-    let mut current_vertex_offset: u16 = 0;
+    let mut current_vertex_offset: u32 = 0;
     for center in centers {
         for i in 0..24 {
             let world_pos = *center + rel_vertices[i];

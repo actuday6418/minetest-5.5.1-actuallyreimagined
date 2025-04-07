@@ -31,7 +31,7 @@ use vulkano::{
             depth_stencil::{DepthState, DepthStencilState},
             input_assembly::InputAssemblyState,
             multisample::MultisampleState,
-            rasterization::RasterizationState,
+            rasterization::{PolygonMode, RasterizationState},
             vertex_input::{Vertex, VertexDefinition},
             viewport::{Viewport, ViewportState},
         },
@@ -56,8 +56,8 @@ use winit::{
 
 mod model;
 
-const MOUSE_SENSITIVITY: f32 = 0.005;
-const MOVE_SPEED: f32 = 0.05;
+const MOUSE_SENSITIVITY: f32 = 0.01;
+const MOVE_SPEED: f32 = 0.5;
 
 fn main() -> Result<(), impl Error> {
     let event_loop = EventLoop::new().unwrap();
@@ -75,7 +75,7 @@ struct App {
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     vertex_buffer: Subbuffer<[Position]>,
     normals_buffer: Subbuffer<[Normal]>,
-    index_buffer: Subbuffer<[u16]>,
+    index_buffer: Subbuffer<[u32]>,
     uniform_buffer_allocator: SubbufferAllocator,
     rcx: Option<RenderContext>,
     camera_position: Vec3,
@@ -124,6 +124,7 @@ impl App {
             .enumerate_physical_devices()
             .unwrap()
             .filter(|p| p.supported_extensions().contains(&device_extensions))
+            .filter(|p| p.supported_features().fill_mode_non_solid)
             .filter_map(|p| {
                 p.queue_family_properties()
                     .iter()
@@ -154,6 +155,10 @@ impl App {
             physical_device,
             DeviceCreateInfo {
                 enabled_extensions: device_extensions,
+                enabled_features: vulkano::device::DeviceFeatures {
+                    fill_mode_non_solid: true,
+                    ..vulkano::device::DeviceFeatures::empty()
+                },
                 queue_create_infos: vec![QueueCreateInfo {
                     queue_family_index,
                     ..Default::default()
@@ -222,7 +227,7 @@ impl App {
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
             },
-            indices, // Use generated indices
+            indices,
         )
         .unwrap();
 
@@ -431,7 +436,7 @@ impl ApplicationHandler for App {
                         self.yaw.sin() * self.pitch.cos(),
                     )
                     .normalize();
-                    self.camera_position += forward * y * 0.1;
+                    self.camera_position += forward * y * MOVE_SPEED;
                 }
                 _ => {}
             },
@@ -732,7 +737,11 @@ fn window_size_dependent_setup(
                     .collect(),
                     ..Default::default()
                 }),
-                rasterization_state: Some(RasterizationState::default()),
+                rasterization_state: Some(RasterizationState {
+                    polygon_mode: PolygonMode::Fill,
+                    cull_mode: vulkano::pipeline::graphics::rasterization::CullMode::None,
+                    ..Default::default()
+                }),
                 depth_stencil_state: Some(DepthStencilState {
                     depth: Some(DepthState::simple()),
                     ..Default::default()
