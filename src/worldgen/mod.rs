@@ -4,6 +4,8 @@ use vulkano::{buffer::BufferContents, pipeline::graphics::vertex_input::Vertex};
 const TEXTURE_SIZE_PIXELS: f32 = 16f32;
 const ATLAS_W: f32 = 1024f32;
 const ATLAS_H: f32 = 1024f32;
+pub const CHUNK_BREADTH: i32 = 16;
+pub const CHUNK_HEIGHT: i32 = 5;
 
 const VERTEX_UVS: [Vec2; 24] = [
     // Front face (+Z)
@@ -82,10 +84,6 @@ pub fn generate_chunk(start_pos: Vec3) -> (Vec<Position>, Vec<Normal>, Vec<TexCo
     let mut tex_coords = Vec::new();
     let mut indices = Vec::new();
 
-    const CHUNK_WIDTH: i32 = 16;
-    const CHUNK_DEPTH: i32 = 16;
-    const CHUNK_HEIGHT: i32 = 5;
-
     let stone_tex_coords = (TEXTURE_SIZE_PIXELS * 3.0, TEXTURE_SIZE_PIXELS * 0.0);
     let dirt_tex_coords = (TEXTURE_SIZE_PIXELS * 2.0, TEXTURE_SIZE_PIXELS * 0.0);
     let grass_top_tex_coords = (TEXTURE_SIZE_PIXELS * 1.0, TEXTURE_SIZE_PIXELS * 0.0);
@@ -156,8 +154,8 @@ pub fn generate_chunk(start_pos: Vec3) -> (Vec<Position>, Vec<Normal>, Vec<TexCo
 
     let mut current_vertex_offset: u32 = 0;
 
-    for x in 0..CHUNK_WIDTH {
-        for z in 0..CHUNK_DEPTH {
+    for x in 0..CHUNK_BREADTH {
+        for z in 0..CHUNK_BREADTH {
             for y in 0..CHUNK_HEIGHT {
                 let block_type = match y {
                     0 | 1 => BlockType::Stone,
@@ -182,11 +180,11 @@ pub fn generate_chunk(start_pos: Vec3) -> (Vec<Position>, Vec<Normal>, Vec<TexCo
                     let neighbor_z = z + offset.2;
 
                     let neighbor_is_solid = neighbor_x >= 0
-                        && neighbor_x < CHUNK_WIDTH
+                        && neighbor_x < CHUNK_BREADTH
                         && neighbor_y >= 0
                         && neighbor_y < CHUNK_HEIGHT
                         && neighbor_z >= 0
-                        && neighbor_z < CHUNK_DEPTH;
+                        && neighbor_z < CHUNK_BREADTH;
 
                     if !neighbor_is_solid {
                         let vertex_start_index_in_cube_data = face_index * 4;

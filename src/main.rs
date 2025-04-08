@@ -1,5 +1,6 @@
 use glam::{Mat4, f32::Vec3};
 use std::{
+    collections::{HashMap, HashSet},
     error::Error,
     path::Path,
     sync::Arc,
@@ -61,18 +62,26 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
-use worldgen::{Normal, Position, TexCoord, generate_chunk};
+use worldgen::{CHUNK_BREADTH, Normal, Position, TexCoord, generate_chunk};
 
 mod worldgen;
 
 const MOUSE_SENSITIVITY: f32 = 0.01;
 const MOVE_SPEED: f32 = 0.5;
+const CHUNK_RADIUS: i32 = 1;
 
 fn main() -> Result<(), impl Error> {
     let event_loop = EventLoop::new().unwrap();
     let mut app = App::new(&event_loop);
 
     event_loop.run_app(&mut app)
+}
+
+struct ChunkData {
+    vertex_buffer: Subbuffer<[Position]>,
+    normal_buffer: Subbuffer<[Normal]>,
+    index_buffer: Subbuffer<[u32]>,
+    texcoord_buffer: Subbuffer<[TexCoord]>,
 }
 
 struct App {
@@ -82,10 +91,7 @@ struct App {
     memory_allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
-    vertex_buffer: Subbuffer<[Position]>,
-    normal_buffer: Subbuffer<[Normal]>,
-    index_buffer: Subbuffer<[u32]>,
-    texcoord_buffer: Subbuffer<[TexCoord]>,
+    loaded_chunks: HashMap<(i32, i32), ChunkData>,
     texture_view: Arc<ImageView>,
     texture_sampler: Arc<Sampler>,
     uniform_buffer_allocator: SubbufferAllocator,
@@ -93,6 +99,7 @@ struct App {
     fps_last_instant: Instant,
     fps_frame_count: u32,
     camera_position: Vec3,
+    last_camera_chunk_coords: (i32, i32),
     yaw: f32,
     pitch: f32,
     is_focused: bool,
@@ -200,65 +207,6 @@ impl App {
         let (tex_w, tex_h) = image.dimensions();
         let image_data = image.into_raw();
 
-        let (positions, normals, tex_coords, indices) = generate_chunk(Vec3::ZERO);
-
-        let vertex_buffer = Buffer::from_iter(
-            memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::VERTEX_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            positions,
-        )
-        .unwrap();
-        let normal_buffer = Buffer::from_iter(
-            memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::VERTEX_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            normals,
-        )
-        .unwrap();
-        let texcoord_buffer = Buffer::from_iter(
-            memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::VERTEX_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            tex_coords,
-        )
-        .unwrap();
-        let index_buffer = Buffer::from_iter(
-            memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::INDEX_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            indices,
-        )
-        .unwrap();
-
         let uniform_buffer_allocator = SubbufferAllocator::new(
             memory_allocator.clone(),
             SubbufferAllocatorCreateInfo {
@@ -335,7 +283,13 @@ impl App {
             .unwrap();
         future.wait(None).unwrap();
 
-        App {
+        let initial_camera_position = Vec3::new(0.0, 6.0, 0.0); // Start slightly above ground
+        let initial_chunk_coords = (
+            (initial_camera_position.x / CHUNK_BREADTH as f32).floor() as i32,
+            (initial_camera_position.z / CHUNK_BREADTH as f32).floor() as i32,
+        );
+
+        let mut app = App {
             instance,
             device,
             queue,
@@ -344,15 +298,13 @@ impl App {
             memory_allocator,
             descriptor_set_allocator,
             command_buffer_allocator,
-            vertex_buffer,
-            normal_buffer,
-            texcoord_buffer,
+            loaded_chunks: HashMap::new(),
             texture_view,
             texture_sampler,
-            index_buffer,
             uniform_buffer_allocator,
             rcx: None,
-            camera_position: Vec3::new(0.0, 0.0, 0.0),
+            camera_position: initial_camera_position,
+            last_camera_chunk_coords: initial_chunk_coords,
             yaw: -std::f32::consts::FRAC_PI_2,
             pitch: 0.0,
             is_focused: false,
@@ -362,7 +314,115 @@ impl App {
             is_moving_right: false,
             is_moving_up: false,
             is_moving_down: false,
+        };
+        app.update_chunks(); // Initial chunk load
+        app
+    }
+
+    fn get_camera_chunk_coords(&self) -> (i32, i32) {
+        (
+            (self.camera_position.x / CHUNK_BREADTH as f32).floor() as i32,
+            (self.camera_position.z / CHUNK_BREADTH as f32).floor() as i32,
+        )
+    }
+
+    fn update_chunks(&mut self) {
+        let camera_coords = self.get_camera_chunk_coords();
+        let mut required_coords = HashSet::new();
+        for x in (camera_coords.0 - CHUNK_RADIUS)..=(camera_coords.0 + CHUNK_RADIUS) {
+            for z in (camera_coords.1 - CHUNK_RADIUS)..=(camera_coords.1 + CHUNK_RADIUS) {
+                required_coords.insert((x, z));
+            }
         }
+
+        let current_coords: HashSet<(i32, i32)> = self.loaded_chunks.keys().cloned().collect();
+
+        let to_unload = current_coords.difference(&required_coords);
+        let to_load = required_coords.difference(&current_coords);
+
+        for coord in to_unload {
+            self.loaded_chunks.remove(coord);
+        }
+
+        for &coord in to_load {
+            let chunk_origin = Vec3::new(
+                coord.0 as f32 * CHUNK_BREADTH as f32,
+                0.0,
+                coord.1 as f32 * CHUNK_BREADTH as f32,
+            );
+            let (positions, normals, tex_coords, indices) = generate_chunk(chunk_origin);
+
+            if indices.is_empty() {
+                continue;
+            }
+
+            let vertex_buffer = Buffer::from_iter(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::VERTEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                positions,
+            )
+            .unwrap();
+            let normal_buffer = Buffer::from_iter(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::VERTEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                normals,
+            )
+            .unwrap();
+            let texcoord_buffer = Buffer::from_iter(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::VERTEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                tex_coords,
+            )
+            .unwrap();
+            let index_buffer = Buffer::from_iter(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::INDEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                indices,
+            )
+            .unwrap();
+
+            let chunk_data = ChunkData {
+                vertex_buffer,
+                normal_buffer,
+                texcoord_buffer,
+                index_buffer,
+            };
+            self.loaded_chunks.insert(coord, chunk_data);
+        }
+
+        self.last_camera_chunk_coords = camera_coords;
     }
 }
 
@@ -567,7 +627,21 @@ impl ApplicationHandler for App {
 
                 if elapsed >= Duration::from_secs(1) {
                     let fps = self.fps_frame_count as f64 / elapsed.as_secs_f64();
-                    println!("FPS: {:.2}", fps); // Print FPS to console
+                    let chunk_count = self.loaded_chunks.len();
+                    let total_vertices: u64 = self
+                        .loaded_chunks
+                        .values()
+                        .map(|c| c.vertex_buffer.len())
+                        .sum();
+                    let total_indices: u64 = self
+                        .loaded_chunks
+                        .values()
+                        .map(|c| c.index_buffer.len())
+                        .sum();
+                    println!(
+                        "FPS: {:.2} | Chunks: {} | Vertices: {} | Indices: {}",
+                        fps, chunk_count, total_vertices, total_indices
+                    );
                     self.fps_frame_count = 0;
                     self.fps_last_instant = now;
                 }
@@ -673,7 +747,7 @@ impl ApplicationHandler for App {
                     .begin_render_pass(
                         RenderPassBeginInfo {
                             clear_values: vec![
-                                Some([0.1, 0.1, 0.1, 1.0].into()),
+                                Some([0.6, 0.8, 1.0, 1.0].into()), // Sky blue clear color
                                 Some(1f32.into()),
                             ],
                             ..RenderPassBeginInfo::framebuffer(
@@ -691,20 +765,26 @@ impl ApplicationHandler for App {
                         0,
                         descriptor_set,
                     )
-                    .unwrap()
-                    .bind_vertex_buffers(
-                        0,
-                        (
-                            self.vertex_buffer.clone(),
-                            self.normal_buffer.clone(),
-                            self.texcoord_buffer.clone(),
-                        ),
-                    )
-                    .unwrap()
-                    .bind_index_buffer(self.index_buffer.clone())
                     .unwrap();
-                unsafe { builder.draw_indexed(self.index_buffer.len() as u32, 1, 0, 0, 0) }
+
+                for chunk_data in self.loaded_chunks.values() {
+                    builder
+                        .bind_vertex_buffers(
+                            0,
+                            (
+                                chunk_data.vertex_buffer.clone(),
+                                chunk_data.normal_buffer.clone(),
+                                chunk_data.texcoord_buffer.clone(),
+                            ),
+                        )
+                        .unwrap()
+                        .bind_index_buffer(chunk_data.index_buffer.clone())
+                        .unwrap();
+                    unsafe {
+                        builder.draw_indexed(chunk_data.index_buffer.len() as u32, 1, 0, 0, 0)
+                    }
                     .unwrap();
+                }
 
                 builder.end_render_pass(Default::default()).unwrap();
 
@@ -749,7 +829,7 @@ impl ApplicationHandler for App {
             self.pitch.sin(),
             self.yaw.sin() * self.pitch.cos(),
         )
-        .normalize();
+        .normalize_or_zero();
         let right = -Vec3::Y.cross(forward).normalize();
         let up = Vec3::Y;
 
@@ -775,6 +855,11 @@ impl ApplicationHandler for App {
 
         if move_delta != Vec3::ZERO {
             self.camera_position += move_delta.normalize() * MOVE_SPEED;
+
+            let current_chunk_coords = self.get_camera_chunk_coords();
+            if current_chunk_coords != self.last_camera_chunk_coords {
+                self.update_chunks();
+            }
         }
 
         if let Some(rcx) = self.rcx.as_mut() {
