@@ -1,6 +1,4 @@
-use self::model::{Normal, Position, generate_cube_mesh};
 use glam::{Mat4, f32::Vec3};
-use model::TexCoord;
 use std::{
     error::Error,
     path::Path,
@@ -63,8 +61,9 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
+use worldgen::{Normal, Position, TexCoord, generate_chunk};
 
-mod model;
+mod worldgen;
 
 const MOUSE_SENSITIVITY: f32 = 0.01;
 const MOVE_SPEED: f32 = 0.5;
@@ -195,20 +194,13 @@ impl App {
             Default::default(),
         ));
 
-        let cube_centers: Vec<Vec3> = dot_vox::load("assets/tall_building.vox").unwrap().models[0]
-            .voxels
-            .iter()
-            .map(|v| Vec3::new(v.x as f32, v.y as f32, v.z as f32))
-            .collect();
-
         let image = image::open(Path::new("assets/atlas.png"))
             .expect("Failed to open texture file")
             .to_rgba8();
         let (tex_w, tex_h) = image.dimensions();
         let image_data = image.into_raw();
 
-        let (positions, normals, tex_coords, indices) =
-            generate_cube_mesh(&cube_centers, tex_w, tex_h);
+        let (positions, normals, tex_coords, indices) = generate_chunk(Vec3::ZERO);
 
         let vertex_buffer = Buffer::from_iter(
             memory_allocator.clone(),
@@ -297,7 +289,7 @@ impl App {
                 mag_filter: Filter::Nearest,
                 min_filter: Filter::Nearest,
                 mipmap_mode: vulkano::image::sampler::SamplerMipmapMode::Nearest,
-                address_mode: [SamplerAddressMode::Repeat; 3],
+                address_mode: [SamplerAddressMode::ClampToEdge; 3],
                 ..Default::default()
             },
         )
@@ -481,7 +473,7 @@ impl ApplicationHandler for App {
             DeviceEvent::MouseMotion { delta: (dx, dy) } => {
                 if self.is_focused {
                     self.yaw += (dx as f32) * MOUSE_SENSITIVITY;
-                    self.pitch += (dy as f32) * MOUSE_SENSITIVITY;
+                    self.pitch -= (dy as f32) * MOUSE_SENSITIVITY;
                     self.pitch = self.pitch.clamp(
                         -std::f32::consts::FRAC_PI_2 + 0.01,
                         std::f32::consts::FRAC_PI_2 - 0.01,
@@ -613,17 +605,20 @@ impl ApplicationHandler for App {
                         self.yaw.sin() * self.pitch.cos(),
                     )
                     .normalize();
-                    let right = Vec3::Y.cross(forward).normalize();
-                    let up = forward.cross(right).normalize();
 
-                    let view =
-                        Mat4::look_at_rh(self.camera_position, self.camera_position + forward, up);
-                    let sun = -Vec3::new(0.48, 0.98, 0.78);
+                    // Vulkan's coordinate system has Y pointing down.
+                    let vk_fix = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0));
+                    let view = Mat4::look_at_rh(
+                        self.camera_position,
+                        self.camera_position + forward,
+                        Vec3::Y,
+                    );
+                    let sun = Vec3::new(0.48, 0.98, 0.78);
 
                     let uniform_data = vs::Data {
                         world: Mat4::IDENTITY.to_cols_array_2d(),
                         view: view.to_cols_array_2d(),
-                        proj: proj.to_cols_array_2d(),
+                        proj: (vk_fix * proj).to_cols_array_2d(),
                         sun: sun.normalize().to_array(),
                     };
 
@@ -756,7 +751,7 @@ impl ApplicationHandler for App {
         )
         .normalize();
         let right = -Vec3::Y.cross(forward).normalize();
-        let up = -Vec3::Y;
+        let up = Vec3::Y;
 
         let mut move_delta = Vec3::ZERO;
         if self.is_moving_forward {
@@ -870,7 +865,7 @@ fn window_size_dependent_setup(
                 }),
                 rasterization_state: Some(RasterizationState {
                     polygon_mode: PolygonMode::Fill,
-                    cull_mode: vulkano::pipeline::graphics::rasterization::CullMode::None,
+                    cull_mode: vulkano::pipeline::graphics::rasterization::CullMode::Back,
                     ..Default::default()
                 }),
                 depth_stencil_state: Some(DepthStencilState {
