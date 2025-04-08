@@ -1,11 +1,50 @@
+use crate::world::{ChunkCoords, World};
 use glam::{Vec2, Vec3};
 use vulkano::{buffer::BufferContents, pipeline::graphics::vertex_input::Vertex};
 
-const TEXTURE_SIZE_PIXELS: f32 = 16f32;
-const ATLAS_W: f32 = 1024f32;
-const ATLAS_H: f32 = 1024f32;
-pub const CHUNK_BREADTH: i32 = 16;
-pub const CHUNK_HEIGHT: i32 = 5;
+const TEXTURE_SIZE_PIXELS: f32 = 16.0;
+pub const ATLAS_W: f32 = 1024.0;
+pub const ATLAS_H: f32 = 1024.0;
+pub const CHUNK_BREADTH: usize = 16;
+pub const CHUNK_HEIGHT: usize = 64;
+
+#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
+#[repr(C)]
+pub struct Position {
+    #[format(R32G32B32_SFLOAT)]
+    pub position: [f32; 3],
+}
+
+#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
+#[repr(C)]
+pub struct Normal {
+    #[format(R32G32B32_SFLOAT)]
+    pub normal: [f32; 3],
+}
+
+#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
+#[repr(C)]
+pub struct TexCoord {
+    #[format(R32G32_SFLOAT)]
+    pub tex_coord: [f32; 2],
+}
+
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum BlockType {
+    Water,
+    Dirt,
+    Grass,
+    Stone,
+}
+
+impl BlockType {
+    pub fn is_opaque(&self) -> bool {
+        match self {
+            BlockType::Water => false,
+            _ => true,
+        }
+    }
+}
 
 const VERTEX_UVS: [Vec2; 24] = [
     // Front face (+Z)
@@ -40,35 +79,6 @@ const VERTEX_UVS: [Vec2; 24] = [
     Vec2::new(0.0, 1.0),
 ];
 
-#[derive(PartialEq)]
-pub enum BlockType {
-    Water,
-    Dirt,
-    Grass,
-    Stone,
-}
-
-#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
-#[repr(C)]
-pub struct Position {
-    #[format(R32G32B32_SFLOAT)]
-    position: [f32; 3],
-}
-
-#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
-#[repr(C)]
-pub struct Normal {
-    #[format(R32G32B32_SFLOAT)]
-    normal: [f32; 3],
-}
-
-#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
-#[repr(C)]
-pub struct TexCoord {
-    #[format(R32G32_SFLOAT)]
-    tex_coord: [f32; 2],
-}
-
 fn get_uv_region(tex_x: f32, tex_y: f32) -> [f32; 4] {
     let min_u = tex_x / ATLAS_W;
     let min_v = tex_y / ATLAS_H;
@@ -78,11 +88,17 @@ fn get_uv_region(tex_x: f32, tex_y: f32) -> [f32; 4] {
     [min_u, min_v, max_u, max_v]
 }
 
-pub fn generate_chunk(start_pos: Vec3) -> (Vec<Position>, Vec<Normal>, Vec<TexCoord>, Vec<u32>) {
+pub fn generate_chunk_mesh(
+    chunk_coords: ChunkCoords,
+    world: &World, // Pass immutable reference to the world state
+) -> (Vec<Position>, Vec<Normal>, Vec<TexCoord>, Vec<u32>) {
+    let chunk_data = world.get_chunk_blocks(chunk_coords).unwrap();
+
     let mut positions = Vec::new();
     let mut normals = Vec::new();
     let mut tex_coords = Vec::new();
     let mut indices = Vec::new();
+    let mut current_vertex_offset: u32 = 0;
 
     let stone_tex_coords = (TEXTURE_SIZE_PIXELS * 3.0, TEXTURE_SIZE_PIXELS * 0.0);
     let dirt_tex_coords = (TEXTURE_SIZE_PIXELS * 2.0, TEXTURE_SIZE_PIXELS * 0.0);
@@ -151,56 +167,56 @@ pub fn generate_chunk(start_pos: Vec3) -> (Vec<Position>, Vec<Normal>, Vec<TexCo
         (0, 1, 0),
         (0, -1, 0),
     ];
+    let chunk_origin_x = chunk_coords.0 * CHUNK_BREADTH as i32;
+    let chunk_origin_z = chunk_coords.1 * CHUNK_BREADTH as i32;
 
-    let mut current_vertex_offset: u32 = 0;
-
-    for x in 0..CHUNK_BREADTH {
-        for z in 0..CHUNK_BREADTH {
-            for y in 0..CHUNK_HEIGHT {
-                let block_type = match y {
-                    0 | 1 => BlockType::Stone,
-                    2 | 3 => BlockType::Dirt,
-                    4 => BlockType::Grass,
-                    _ => unreachable!(),
+    for lx in 0..CHUNK_BREADTH {
+        for ly in 0..CHUNK_HEIGHT {
+            for lz in 0..CHUNK_BREADTH {
+                let block_type = match chunk_data.get_local_block(lx, ly, lz) {
+                    Some(bt) => bt,
+                    None => continue,
                 };
 
-                let center = start_pos + Vec3::new(x as f32 + H, y as f32 + H, z as f32 + H);
+                if *block_type == BlockType::Water {
+                    continue;
+                }
+
+                let gx = chunk_origin_x + lx as i32;
+                let gy = ly as i32;
+                let gz = chunk_origin_z + lz as i32;
+                let block_center = Vec3::new(gx as f32 + H, gy as f32 + H, gz as f32 + H);
 
                 let block_face_regions = match block_type {
                     BlockType::Stone => &stone_face_regions,
                     BlockType::Dirt => &dirt_face_regions,
                     BlockType::Grass => &grass_face_regions,
-                    _ => continue,
+                    BlockType::Water => continue,
                 };
 
                 for face_index in 0..6 {
                     let offset = neighbor_offsets[face_index];
-                    let neighbor_x = x + offset.0;
-                    let neighbor_y = y + offset.1;
-                    let neighbor_z = z + offset.2;
+                    let neighbor_gx = gx + offset.0;
+                    let neighbor_gy = gy + offset.1;
+                    let neighbor_gz = gz + offset.2;
 
-                    let neighbor_is_solid = neighbor_x >= 0
-                        && neighbor_x < CHUNK_BREADTH
-                        && neighbor_y >= 0
-                        && neighbor_y < CHUNK_HEIGHT
-                        && neighbor_z >= 0
-                        && neighbor_z < CHUNK_BREADTH;
+                    let neighbor_is_opaque = world
+                        .get_block(neighbor_gx, neighbor_gy, neighbor_gz)
+                        .map_or(false, |neighbor_type| neighbor_type.is_opaque());
 
-                    if !neighbor_is_solid {
+                    if !neighbor_is_opaque {
                         let vertex_start_index_in_cube_data = face_index * 4;
                         let normal = face_normals[face_index];
                         let region = block_face_regions[face_index];
 
                         let region_min_u = region[0];
                         let region_min_v = region[1];
-                        let region_max_u = region[2];
-                        let region_max_v = region[3];
-                        let region_width = region_max_u - region_min_u;
-                        let region_height = region_max_v - region_min_v;
+                        let region_width = region[2] - region_min_u;
+                        let region_height = region[3] - region_min_v;
 
                         for i in 0..4 {
                             let data_idx = vertex_start_index_in_cube_data + i;
-                            let world_pos = center + rel_vertices[data_idx];
+                            let world_pos = block_center + rel_vertices[data_idx];
                             positions.push(Position {
                                 position: world_pos.to_array(),
                             });

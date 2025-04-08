@@ -62,13 +62,16 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
-use worldgen::{CHUNK_BREADTH, Normal, Position, TexCoord, generate_chunk};
 
+mod world;
 mod worldgen;
+
+use world::{ChunkCoords, World};
+use worldgen::{ATLAS_H, ATLAS_W, CHUNK_BREADTH, Normal, Position, TexCoord, generate_chunk_mesh};
 
 const MOUSE_SENSITIVITY: f32 = 0.01;
 const MOVE_SPEED: f32 = 0.5;
-const CHUNK_RADIUS: i32 = 1;
+const CHUNK_RADIUS: i32 = 20;
 
 fn main() -> Result<(), impl Error> {
     let event_loop = EventLoop::new().unwrap();
@@ -91,7 +94,8 @@ struct App {
     memory_allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
-    loaded_chunks: HashMap<(i32, i32), ChunkData>,
+    world: World,
+    loaded_chunks: HashMap<ChunkCoords, ChunkData>,
     texture_view: Arc<ImageView>,
     texture_sampler: Arc<Sampler>,
     uniform_buffer_allocator: SubbufferAllocator,
@@ -99,7 +103,7 @@ struct App {
     fps_last_instant: Instant,
     fps_frame_count: u32,
     camera_position: Vec3,
-    last_camera_chunk_coords: (i32, i32),
+    last_camera_chunk_coords: ChunkCoords,
     yaw: f32,
     pitch: f32,
     is_focused: bool,
@@ -145,7 +149,6 @@ impl App {
             .enumerate_physical_devices()
             .unwrap()
             .filter(|p| p.supported_extensions().contains(&device_extensions))
-            .filter(|p| p.supported_features().fill_mode_non_solid)
             .filter_map(|p| {
                 p.queue_family_properties()
                     .iter()
@@ -176,10 +179,6 @@ impl App {
             physical_device,
             DeviceCreateInfo {
                 enabled_extensions: device_extensions,
-                enabled_features: vulkano::device::DeviceFeatures {
-                    fill_mode_non_solid: true,
-                    ..vulkano::device::DeviceFeatures::empty()
-                },
                 queue_create_infos: vec![QueueCreateInfo {
                     queue_family_index,
                     ..Default::default()
@@ -204,24 +203,14 @@ impl App {
         let image = image::open(Path::new("assets/atlas.png"))
             .expect("Failed to open texture file")
             .to_rgba8();
-        let (tex_w, tex_h) = image.dimensions();
         let image_data = image.into_raw();
 
-        let uniform_buffer_allocator = SubbufferAllocator::new(
-            memory_allocator.clone(),
-            SubbufferAllocatorCreateInfo {
-                buffer_usage: BufferUsage::UNIFORM_BUFFER,
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-        );
         let texture_image = Image::new(
             memory_allocator.clone(),
             ImageCreateInfo {
                 image_type: ImageType::Dim2d,
                 format: Format::R8G8B8A8_UNORM,
-                extent: [tex_w, tex_h, 1],
+                extent: [ATLAS_W as u32, ATLAS_H as u32, 1],
                 usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
                 ..Default::default()
             },
@@ -273,7 +262,6 @@ impl App {
                 ),
             )
             .unwrap();
-
         let upload_cb = upload_cb_builder.build().unwrap();
 
         let future = sync::now(device.clone())
@@ -283,12 +271,20 @@ impl App {
             .unwrap();
         future.wait(None).unwrap();
 
-        let initial_camera_position = Vec3::new(0.0, 6.0, 0.0); // Start slightly above ground
-        let initial_chunk_coords = (
-            (initial_camera_position.x / CHUNK_BREADTH as f32).floor() as i32,
-            (initial_camera_position.z / CHUNK_BREADTH as f32).floor() as i32,
+        let uniform_buffer_allocator = SubbufferAllocator::new(
+            memory_allocator.clone(),
+            SubbufferAllocatorCreateInfo {
+                buffer_usage: BufferUsage::UNIFORM_BUFFER,
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
         );
 
+        let initial_camera_position = Vec3::new(0.0, 20.0, 0.0);
+        let initial_chunk_coords = Self::get_chunk_coords_at(initial_camera_position);
+
+        let world = World::new();
         let mut app = App {
             instance,
             device,
@@ -298,6 +294,7 @@ impl App {
             memory_allocator,
             descriptor_set_allocator,
             command_buffer_allocator,
+            world,
             loaded_chunks: HashMap::new(),
             texture_view,
             texture_sampler,
@@ -306,7 +303,7 @@ impl App {
             camera_position: initial_camera_position,
             last_camera_chunk_coords: initial_chunk_coords,
             yaw: -std::f32::consts::FRAC_PI_2,
-            pitch: 0.0,
+            pitch: -0.0,
             is_focused: false,
             is_moving_forward: false,
             is_moving_backward: false,
@@ -315,19 +312,20 @@ impl App {
             is_moving_up: false,
             is_moving_down: false,
         };
-        app.update_chunks(); // Initial chunk load
+        app.update_chunks();
         app
     }
 
-    fn get_camera_chunk_coords(&self) -> (i32, i32) {
+    fn get_chunk_coords_at(position: Vec3) -> ChunkCoords {
         (
-            (self.camera_position.x / CHUNK_BREADTH as f32).floor() as i32,
-            (self.camera_position.z / CHUNK_BREADTH as f32).floor() as i32,
+            (position.x / CHUNK_BREADTH as f32).floor() as i32,
+            (position.z / CHUNK_BREADTH as f32).floor() as i32,
         )
     }
 
     fn update_chunks(&mut self) {
-        let camera_coords = self.get_camera_chunk_coords();
+        let camera_coords = Self::get_chunk_coords_at(self.camera_position);
+
         let mut required_coords = HashSet::new();
         for x in (camera_coords.0 - CHUNK_RADIUS)..=(camera_coords.0 + CHUNK_RADIUS) {
             for z in (camera_coords.1 - CHUNK_RADIUS)..=(camera_coords.1 + CHUNK_RADIUS) {
@@ -335,26 +333,42 @@ impl App {
             }
         }
 
-        let current_coords: HashSet<(i32, i32)> = self.loaded_chunks.keys().cloned().collect();
+        let current_mesh_coords: HashSet<ChunkCoords> =
+            self.loaded_chunks.keys().cloned().collect();
+        let mut neighbors_to_remesh = HashSet::new();
 
-        let to_unload = current_coords.difference(&required_coords);
-        let to_load = required_coords.difference(&current_coords);
-
-        for coord in to_unload {
-            self.loaded_chunks.remove(coord);
+        let coords_to_unload = current_mesh_coords
+            .difference(&required_coords)
+            .cloned()
+            .collect::<Vec<_>>();
+        for &coord in &coords_to_unload {
+            self.loaded_chunks.remove(&coord);
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    if dx == 0 && dz == 0 {
+                        continue;
+                    }
+                    let neighbor_coord = (coord.0 + dx, coord.1 + dz);
+                    if required_coords.contains(&neighbor_coord) {
+                        neighbors_to_remesh.insert(neighbor_coord);
+                    }
+                }
+            }
         }
 
-        for &coord in to_load {
-            let chunk_origin = Vec3::new(
-                coord.0 as f32 * CHUNK_BREADTH as f32,
-                0.0,
-                coord.1 as f32 * CHUNK_BREADTH as f32,
-            );
-            let (positions, normals, tex_coords, indices) = generate_chunk(chunk_origin);
-
-            if indices.is_empty() {
-                continue;
+        let coords_to_load = required_coords
+            .difference(&current_mesh_coords)
+            .cloned()
+            .collect::<Vec<_>>();
+        for &coord in &coords_to_load {
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    self.world
+                        .ensure_chunk_generated((coord.0 + dx, coord.1 + dz));
+                }
             }
+
+            let (positions, normals, tex_coords, indices) = generate_chunk_mesh(coord, &self.world);
 
             let vertex_buffer = Buffer::from_iter(
                 self.memory_allocator.clone(),
@@ -420,6 +434,95 @@ impl App {
                 index_buffer,
             };
             self.loaded_chunks.insert(coord, chunk_data);
+
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    if dx == 0 && dz == 0 {
+                        continue;
+                    }
+                    let neighbor_coord = (coord.0 + dx, coord.1 + dz);
+                    if current_mesh_coords.contains(&neighbor_coord) {
+                        neighbors_to_remesh.insert(neighbor_coord);
+                    }
+                }
+            }
+        }
+
+        for unloaded_coord in coords_to_unload {
+            neighbors_to_remesh.remove(&unloaded_coord);
+        }
+        for loaded_coord in coords_to_load {
+            neighbors_to_remesh.remove(&loaded_coord);
+        }
+
+        for &coord_to_remesh in &neighbors_to_remesh {
+            self.loaded_chunks.remove(&coord_to_remesh);
+            let (positions, normals, tex_coords, indices) =
+                generate_chunk_mesh(coord_to_remesh, &self.world);
+            let vertex_buffer = Buffer::from_iter(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::VERTEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                positions,
+            )
+            .unwrap();
+            let normal_buffer = Buffer::from_iter(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::VERTEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                normals,
+            )
+            .unwrap();
+            let texcoord_buffer = Buffer::from_iter(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::VERTEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                tex_coords,
+            )
+            .unwrap();
+            let index_buffer = Buffer::from_iter(
+                self.memory_allocator.clone(),
+                BufferCreateInfo {
+                    usage: BufferUsage::INDEX_BUFFER,
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                indices,
+            )
+            .unwrap();
+
+            let chunk_data = ChunkData {
+                vertex_buffer,
+                normal_buffer,
+                texcoord_buffer,
+                index_buffer,
+            };
+            self.loaded_chunks.insert(coord_to_remesh, chunk_data);
         }
 
         self.last_camera_chunk_coords = camera_coords;
@@ -569,36 +672,30 @@ impl ApplicationHandler for App {
                     PhysicalKey::Code(KeyCode::Space) => self.is_moving_up = is_pressed,
                     PhysicalKey::Code(KeyCode::ShiftLeft) => self.is_moving_down = is_pressed,
                     PhysicalKey::Code(KeyCode::Escape) => {
-                        self.is_focused = false;
-                        rcx.window
-                            .set_cursor_grab(winit::window::CursorGrabMode::None)
-                            .unwrap();
-                        rcx.window.set_cursor_visible(true);
+                        if is_pressed {
+                            self.is_focused = false;
+                            rcx.window
+                                .set_cursor_grab(winit::window::CursorGrabMode::None)
+                                .unwrap();
+                            rcx.window.set_cursor_visible(true);
+                        }
                     }
                     _ => {}
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if state == ElementState::Pressed && button == winit::event::MouseButton::Left {
+                if !self.is_focused
+                    && state == ElementState::Pressed
+                    && button == winit::event::MouseButton::Left
+                {
                     self.is_focused = true;
                     rcx.window
                         .set_cursor_grab(winit::window::CursorGrabMode::Locked)
                         .unwrap();
                     rcx.window.set_cursor_visible(false);
                 }
+                // Potentially add block breaking/placing logic here
             }
-            WindowEvent::MouseWheel { delta, .. } => match delta {
-                winit::event::MouseScrollDelta::LineDelta(_, y) => {
-                    let forward = Vec3::new(
-                        self.yaw.cos() * self.pitch.cos(),
-                        self.pitch.sin(),
-                        self.yaw.sin() * self.pitch.cos(),
-                    )
-                    .normalize();
-                    self.camera_position += forward * y * MOVE_SPEED;
-                }
-                _ => {}
-            },
             WindowEvent::Focused(focused) => {
                 self.is_focused = focused;
                 rcx.window
@@ -621,10 +718,10 @@ impl ApplicationHandler for App {
                 }
 
                 rcx.previous_frame_end.as_mut().unwrap().cleanup_finished();
+
                 self.fps_frame_count += 1;
                 let now = Instant::now();
                 let elapsed = now.duration_since(self.fps_last_instant);
-
                 if elapsed >= Duration::from_secs(1) {
                     let fps = self.fps_frame_count as f64 / elapsed.as_secs_f64();
                     let chunk_count = self.loaded_chunks.len();
@@ -639,20 +736,25 @@ impl ApplicationHandler for App {
                         .map(|c| c.index_buffer.len())
                         .sum();
                     println!(
-                        "FPS: {:.2} | Chunks: {} | Vertices: {} | Indices: {}",
+                        "FPS: {:.2} | Chunks: {} | Verts: {} | Idx: {}",
                         fps, chunk_count, total_vertices, total_indices
                     );
                     self.fps_frame_count = 0;
                     self.fps_last_instant = now;
                 }
+
                 if rcx.recreate_swapchain {
-                    let (new_swapchain, new_images) = rcx
-                        .swapchain
-                        .recreate(SwapchainCreateInfo {
+                    let (new_swapchain, new_images) =
+                        match rcx.swapchain.recreate(SwapchainCreateInfo {
                             image_extent: window_size.into(),
                             ..rcx.swapchain.create_info()
-                        })
-                        .expect("failed to recreate swapchain");
+                        }) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                println!("Failed to recreate swapchain: {}", e);
+                                return;
+                            }
+                        };
 
                     rcx.swapchain = new_swapchain;
                     (rcx.framebuffers, rcx.pipeline) = window_size_dependent_setup(
@@ -670,8 +772,12 @@ impl ApplicationHandler for App {
                     let aspect_ratio = rcx.swapchain.image_extent()[0] as f32
                         / rcx.swapchain.image_extent()[1] as f32;
 
-                    let proj =
-                        Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, aspect_ratio, 0.1, 100.0);
+                    let proj = Mat4::perspective_rh(
+                        std::f32::consts::FRAC_PI_2,
+                        aspect_ratio,
+                        0.1,
+                        2000.0,
+                    );
 
                     let forward = Vec3::new(
                         self.yaw.cos() * self.pitch.cos(),
@@ -687,18 +793,17 @@ impl ApplicationHandler for App {
                         self.camera_position + forward,
                         Vec3::Y,
                     );
-                    let sun = Vec3::new(0.48, 0.98, 0.78);
+                    let sun = Vec3::new(0.48, 0.98, 0.78).normalize();
 
                     let uniform_data = vs::Data {
                         world: Mat4::IDENTITY.to_cols_array_2d(),
                         view: view.to_cols_array_2d(),
                         proj: (vk_fix * proj).to_cols_array_2d(),
-                        sun: sun.normalize().to_array(),
+                        sun: sun.to_array(),
                     };
 
                     let buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
                     *buffer.write().unwrap() = uniform_data;
-
                     buffer
                 };
 
@@ -747,7 +852,7 @@ impl ApplicationHandler for App {
                     .begin_render_pass(
                         RenderPassBeginInfo {
                             clear_values: vec![
-                                Some([0.6, 0.8, 1.0, 1.0].into()), // Sky blue clear color
+                                Some([0.6, 0.8, 1.0, 1.0].into()),
                                 Some(1f32.into()),
                             ],
                             ..RenderPassBeginInfo::framebuffer(
@@ -766,7 +871,6 @@ impl ApplicationHandler for App {
                         descriptor_set,
                     )
                     .unwrap();
-
                 for chunk_data in self.loaded_chunks.values() {
                     builder
                         .bind_vertex_buffers(
@@ -831,8 +935,6 @@ impl ApplicationHandler for App {
         )
         .normalize_or_zero();
         let right = -Vec3::Y.cross(forward).normalize();
-        let up = Vec3::Y;
-
         let mut move_delta = Vec3::ZERO;
         if self.is_moving_forward {
             move_delta += forward;
@@ -847,21 +949,19 @@ impl ApplicationHandler for App {
             move_delta -= right;
         }
         if self.is_moving_up {
-            move_delta += up;
+            move_delta += Vec3::Y;
         }
         if self.is_moving_down {
-            move_delta -= up;
+            move_delta -= Vec3::Y;
         }
 
         if move_delta != Vec3::ZERO {
             self.camera_position += move_delta.normalize() * MOVE_SPEED;
-
-            let current_chunk_coords = self.get_camera_chunk_coords();
+            let current_chunk_coords = Self::get_chunk_coords_at(self.camera_position);
             if current_chunk_coords != self.last_camera_chunk_coords {
                 self.update_chunks();
             }
         }
-
         if let Some(rcx) = self.rcx.as_mut() {
             rcx.window.request_redraw();
         }
@@ -898,7 +998,6 @@ fn window_size_dependent_setup(
         .iter()
         .map(|image| {
             let view = ImageView::new_default(image.clone()).unwrap();
-
             Framebuffer::new(
                 render_pass.clone(),
                 FramebufferCreateInfo {
@@ -949,8 +1048,8 @@ fn window_size_dependent_setup(
                     ..Default::default()
                 }),
                 rasterization_state: Some(RasterizationState {
-                    polygon_mode: PolygonMode::Fill,
                     cull_mode: vulkano::pipeline::graphics::rasterization::CullMode::Back,
+                    polygon_mode: PolygonMode::Fill,
                     ..Default::default()
                 }),
                 depth_stencil_state: Some(DepthStencilState {
