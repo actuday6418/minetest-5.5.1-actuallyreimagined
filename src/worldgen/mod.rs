@@ -90,7 +90,7 @@ fn get_uv_region(tex_x: f32, tex_y: f32) -> [f32; 4] {
 
 pub fn generate_chunk_mesh(
     chunk_coords: ChunkCoords,
-    world: &World, // Pass immutable reference to the world state
+    world: &World,
 ) -> (Vec<Position>, Vec<Normal>, Vec<TexCoord>, Vec<u32>) {
     let chunk_data = world.get_chunk_blocks(chunk_coords).unwrap();
 
@@ -191,7 +191,7 @@ pub fn generate_chunk_mesh(
                     BlockType::Stone => &stone_face_regions,
                     BlockType::Dirt => &dirt_face_regions,
                     BlockType::Grass => &grass_face_regions,
-                    BlockType::Water => continue,
+                    BlockType::Water => unreachable!(),
                 };
 
                 for face_index in 0..6 {

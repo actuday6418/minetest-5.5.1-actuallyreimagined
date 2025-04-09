@@ -1,9 +1,11 @@
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use glam::{Mat4, f32::Vec3};
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
     path::Path,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use vulkano::{
@@ -66,12 +68,13 @@ use winit::{
 mod world;
 mod worldgen;
 
-use world::{ChunkCoords, World};
+use world::{ChunkBlocks, ChunkCoords, World};
 use worldgen::{ATLAS_H, ATLAS_W, CHUNK_BREADTH, Normal, Position, TexCoord, generate_chunk_mesh};
 
 const MOUSE_SENSITIVITY: f32 = 0.01;
 const MOVE_SPEED: f32 = 0.5;
-const CHUNK_RADIUS: i32 = 20;
+const CHUNK_RADIUS: i32 = 25;
+const MAX_UPLOADS_PER_FRAME: usize = 100;
 
 fn main() -> Result<(), impl Error> {
     let event_loop = EventLoop::new().unwrap();
@@ -87,6 +90,15 @@ struct ChunkData {
     texcoord_buffer: Subbuffer<[TexCoord]>,
 }
 
+struct CpuMeshData {
+    positions: Vec<Position>,
+    normals: Vec<Normal>,
+    tex_coords: Vec<TexCoord>,
+    indices: Vec<u32>,
+}
+
+type MeshGenResult = (ChunkCoords, CpuMeshData);
+
 struct App {
     instance: Arc<Instance>,
     device: Arc<Device>,
@@ -94,8 +106,10 @@ struct App {
     memory_allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
-    world: World,
+    world: Arc<RwLock<World>>,
     loaded_chunks: HashMap<ChunkCoords, ChunkData>,
+    generating_chunks: HashSet<ChunkCoords>,
+    pending_upload: HashMap<ChunkCoords, CpuMeshData>,
     texture_view: Arc<ImageView>,
     texture_sampler: Arc<Sampler>,
     uniform_buffer_allocator: SubbufferAllocator,
@@ -113,6 +127,9 @@ struct App {
     is_moving_right: bool,
     is_moving_up: bool,
     is_moving_down: bool,
+    thread_pool: Arc<ThreadPool>,
+    result_sender: Sender<MeshGenResult>,
+    result_receiver: Receiver<MeshGenResult>,
 }
 
 struct RenderContext {
@@ -189,7 +206,6 @@ impl App {
         .unwrap();
 
         let queue = queues.next().unwrap();
-
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
         let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
             device.clone(),
@@ -204,7 +220,6 @@ impl App {
             .expect("Failed to open texture file")
             .to_rgba8();
         let image_data = image.into_raw();
-
         let texture_image = Image::new(
             memory_allocator.clone(),
             ImageCreateInfo {
@@ -217,9 +232,7 @@ impl App {
             AllocationCreateInfo::default(),
         )
         .unwrap();
-
         let texture_view = ImageView::new_default(texture_image.clone()).unwrap();
-
         let texture_sampler = Sampler::new(
             device.clone(),
             SamplerCreateInfo {
@@ -231,7 +244,6 @@ impl App {
             },
         )
         .unwrap();
-
         let upload_buffer = Buffer::from_iter(
             memory_allocator.clone(),
             BufferCreateInfo {
@@ -246,14 +258,12 @@ impl App {
             image_data,
         )
         .unwrap();
-
         let mut upload_cb_builder = AutoCommandBufferBuilder::primary(
             command_buffer_allocator.clone(),
             queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
         .unwrap();
-
         upload_cb_builder
             .copy_buffer_to_image(
                 vulkano::command_buffer::CopyBufferToImageInfo::buffer_image(
@@ -263,7 +273,6 @@ impl App {
             )
             .unwrap();
         let upload_cb = upload_cb_builder.build().unwrap();
-
         let future = sync::now(device.clone())
             .then_execute(queue.clone(), upload_cb)
             .unwrap()
@@ -284,7 +293,11 @@ impl App {
         let initial_camera_position = Vec3::new(0.0, 20.0, 0.0);
         let initial_chunk_coords = Self::get_chunk_coords_at(initial_camera_position);
 
-        let world = World::new();
+        let thread_pool = Arc::new(ThreadPoolBuilder::new().num_threads(12).build().unwrap());
+        let (result_sender, result_receiver) = unbounded::<MeshGenResult>();
+
+        let world = Arc::new(RwLock::new(World::new()));
+
         let mut app = App {
             instance,
             device,
@@ -296,6 +309,8 @@ impl App {
             command_buffer_allocator,
             world,
             loaded_chunks: HashMap::new(),
+            generating_chunks: HashSet::new(),
+            pending_upload: HashMap::new(),
             texture_view,
             texture_sampler,
             uniform_buffer_allocator,
@@ -311,8 +326,12 @@ impl App {
             is_moving_right: false,
             is_moving_up: false,
             is_moving_down: false,
+            thread_pool,
+            result_sender,
+            result_receiver,
         };
-        app.update_chunks();
+
+        app.request_chunks_around_camera();
         app
     }
 
@@ -323,7 +342,8 @@ impl App {
         )
     }
 
-    fn update_chunks(&mut self) {
+    fn request_chunks_around_camera(&mut self) {
+        const DIRECT_NEIGHBOR_OFFSETS: [(i32, i32); 4] = [(0, 1), (0, -1), (1, 0), (-1, 0)];
         let camera_coords = Self::get_chunk_coords_at(self.camera_position);
 
         let mut required_coords = HashSet::new();
@@ -335,130 +355,119 @@ impl App {
 
         let current_mesh_coords: HashSet<ChunkCoords> =
             self.loaded_chunks.keys().cloned().collect();
+        let current_pending_coords: HashSet<ChunkCoords> =
+            self.pending_upload.keys().cloned().collect();
+        let all_known_coords = current_mesh_coords
+            .union(&current_pending_coords)
+            .cloned()
+            .collect::<HashSet<_>>()
+            .union(&self.generating_chunks)
+            .cloned()
+            .collect::<HashSet<_>>();
+
         let mut neighbors_to_remesh = HashSet::new();
 
-        let coords_to_unload = current_mesh_coords
+        let coords_to_unload = all_known_coords
             .difference(&required_coords)
             .cloned()
             .collect::<Vec<_>>();
+
         for &coord in &coords_to_unload {
             self.loaded_chunks.remove(&coord);
-            for dx in -1..=1 {
-                for dz in -1..=1 {
-                    if dx == 0 && dz == 0 {
-                        continue;
-                    }
-                    let neighbor_coord = (coord.0 + dx, coord.1 + dz);
-                    if required_coords.contains(&neighbor_coord) {
-                        neighbors_to_remesh.insert(neighbor_coord);
-                    }
+            self.pending_upload.remove(&coord);
+            self.generating_chunks.remove(&coord);
+
+            for (dx, dz) in DIRECT_NEIGHBOR_OFFSETS {
+                let neighbor_coord = (coord.0 + dx, coord.1 + dz);
+                if required_coords.contains(&neighbor_coord)
+                    && self.loaded_chunks.contains_key(&neighbor_coord)
+                {
+                    neighbors_to_remesh.insert(neighbor_coord);
                 }
             }
         }
 
-        let coords_to_load = required_coords
-            .difference(&current_mesh_coords)
+        let mut coords_to_generate = required_coords
+            .difference(&all_known_coords)
             .cloned()
-            .collect::<Vec<_>>();
-        for &coord in &coords_to_load {
-            for dx in -1..=1 {
-                for dz in -1..=1 {
-                    self.world
-                        .ensure_chunk_generated((coord.0 + dx, coord.1 + dz));
-                }
-            }
+            .collect::<HashSet<_>>();
 
-            let (positions, normals, tex_coords, indices) = generate_chunk_mesh(coord, &self.world);
-
-            let vertex_buffer = Buffer::from_iter(
-                self.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::VERTEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                positions,
-            )
-            .unwrap();
-            let normal_buffer = Buffer::from_iter(
-                self.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::VERTEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                normals,
-            )
-            .unwrap();
-            let texcoord_buffer = Buffer::from_iter(
-                self.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::VERTEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                tex_coords,
-            )
-            .unwrap();
-            let index_buffer = Buffer::from_iter(
-                self.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::INDEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                indices,
-            )
-            .unwrap();
-
-            let chunk_data = ChunkData {
-                vertex_buffer,
-                normal_buffer,
-                texcoord_buffer,
-                index_buffer,
-            };
-            self.loaded_chunks.insert(coord, chunk_data);
-
-            for dx in -1..=1 {
-                for dz in -1..=1 {
-                    if dx == 0 && dz == 0 {
-                        continue;
-                    }
-                    let neighbor_coord = (coord.0 + dx, coord.1 + dz);
-                    if current_mesh_coords.contains(&neighbor_coord) {
-                        neighbors_to_remesh.insert(neighbor_coord);
-                    }
-                }
-            }
-        }
-
-        for unloaded_coord in coords_to_unload {
-            neighbors_to_remesh.remove(&unloaded_coord);
-        }
-        for loaded_coord in coords_to_load {
-            neighbors_to_remesh.remove(&loaded_coord);
-        }
-
-        for &coord_to_remesh in &neighbors_to_remesh {
+        for coord_to_remesh in neighbors_to_remesh {
             self.loaded_chunks.remove(&coord_to_remesh);
-            let (positions, normals, tex_coords, indices) =
-                generate_chunk_mesh(coord_to_remesh, &self.world);
+            self.pending_upload.remove(&coord_to_remesh);
+            self.generating_chunks.remove(&coord_to_remesh);
+            coords_to_generate.insert(coord_to_remesh);
+        }
+
+        for coord in coords_to_generate {
+            if self.generating_chunks.contains(&coord)
+                || self.pending_upload.contains_key(&coord)
+                || self.loaded_chunks.contains_key(&coord)
+            {
+                continue;
+            }
+            self.generating_chunks.insert(coord);
+
+            let world_arc = self.world.clone();
+            let pool = self.thread_pool.clone();
+            let result_sender = self.result_sender.clone();
+
+            pool.spawn(move || {
+                let chunk_blocks = ChunkBlocks::generate(coord);
+
+                {
+                    let mut world_writer = world_arc.write().unwrap();
+                    world_writer.insert_chunk_blocks(coord, Arc::new(chunk_blocks));
+
+                    for (dx, dz) in DIRECT_NEIGHBOR_OFFSETS {
+                        let neighbor_coord = (coord.0 + dx, coord.1 + dz);
+                        world_writer.ensure_chunk_generated(neighbor_coord);
+                    }
+                }
+
+                let (positions, normals, tex_coords, indices) = {
+                    let world_reader = world_arc.read().unwrap();
+                    generate_chunk_mesh(coord, &world_reader)
+                };
+
+                let cpu_mesh_data = CpuMeshData {
+                    positions,
+                    normals,
+                    tex_coords,
+                    indices,
+                };
+
+                let _ = result_sender.send((coord, cpu_mesh_data));
+            });
+        }
+        self.last_camera_chunk_coords = camera_coords;
+    }
+
+    fn process_pending_uploads(&mut self) {
+        while let Ok((coords, cpu_mesh_data)) = self.result_receiver.try_recv() {
+            if self.generating_chunks.remove(&coords) {
+                if !self.loaded_chunks.contains_key(&coords) {
+                    self.pending_upload.insert(coords, cpu_mesh_data);
+                }
+            }
+        }
+
+        let mut uploaded_count = 0;
+        let mut coords_uploaded = Vec::new();
+
+        for (coord, cpu_data) in self.pending_upload.iter() {
+            if uploaded_count >= MAX_UPLOADS_PER_FRAME {
+                break;
+            }
+
+            let camera_coords = Self::get_chunk_coords_at(self.camera_position);
+            let dx = (coord.0 - camera_coords.0).abs();
+            let dz = (coord.1 - camera_coords.1).abs();
+            if dx > CHUNK_RADIUS || dz > CHUNK_RADIUS {
+                coords_uploaded.push(*coord);
+                continue;
+            }
+
             let vertex_buffer = Buffer::from_iter(
                 self.memory_allocator.clone(),
                 BufferCreateInfo {
@@ -470,7 +479,7 @@ impl App {
                         | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                     ..Default::default()
                 },
-                positions,
+                cpu_data.positions.clone(),
             )
             .unwrap();
             let normal_buffer = Buffer::from_iter(
@@ -484,7 +493,7 @@ impl App {
                         | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                     ..Default::default()
                 },
-                normals,
+                cpu_data.normals.clone(),
             )
             .unwrap();
             let texcoord_buffer = Buffer::from_iter(
@@ -498,7 +507,7 @@ impl App {
                         | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                     ..Default::default()
                 },
-                tex_coords,
+                cpu_data.tex_coords.clone(),
             )
             .unwrap();
             let index_buffer = Buffer::from_iter(
@@ -512,7 +521,7 @@ impl App {
                         | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                     ..Default::default()
                 },
-                indices,
+                cpu_data.indices.clone(),
             )
             .unwrap();
 
@@ -522,10 +531,15 @@ impl App {
                 texcoord_buffer,
                 index_buffer,
             };
-            self.loaded_chunks.insert(coord_to_remesh, chunk_data);
+
+            self.loaded_chunks.insert(*coord, chunk_data);
+            coords_uploaded.push(*coord);
+            uploaded_count += 1;
         }
 
-        self.last_camera_chunk_coords = camera_coords;
+        for coord in coords_uploaded {
+            self.pending_upload.remove(&coord);
+        }
     }
 }
 
@@ -694,18 +708,20 @@ impl ApplicationHandler for App {
                         .unwrap();
                     rcx.window.set_cursor_visible(false);
                 }
-                // Potentially add block breaking/placing logic here
             }
             WindowEvent::Focused(focused) => {
                 self.is_focused = focused;
-                rcx.window
-                    .set_cursor_grab(if focused {
-                        winit::window::CursorGrabMode::Locked
-                    } else {
-                        winit::window::CursorGrabMode::None
-                    })
-                    .unwrap();
-                rcx.window.set_cursor_visible(false);
+                if !focused {
+                    rcx.window
+                        .set_cursor_grab(winit::window::CursorGrabMode::None)
+                        .unwrap();
+                    rcx.window.set_cursor_visible(true);
+                } else {
+                    rcx.window
+                        .set_cursor_grab(winit::window::CursorGrabMode::Locked)
+                        .unwrap();
+                    rcx.window.set_cursor_visible(false);
+                }
             }
             WindowEvent::Resized(_) => {
                 rcx.recreate_swapchain = true;
@@ -724,20 +740,12 @@ impl ApplicationHandler for App {
                 let elapsed = now.duration_since(self.fps_last_instant);
                 if elapsed >= Duration::from_secs(1) {
                     let fps = self.fps_frame_count as f64 / elapsed.as_secs_f64();
-                    let chunk_count = self.loaded_chunks.len();
-                    let total_vertices: u64 = self
-                        .loaded_chunks
-                        .values()
-                        .map(|c| c.vertex_buffer.len())
-                        .sum();
-                    let total_indices: u64 = self
-                        .loaded_chunks
-                        .values()
-                        .map(|c| c.index_buffer.len())
-                        .sum();
                     println!(
-                        "FPS: {:.2} | Chunks: {} | Verts: {} | Idx: {}",
-                        fps, chunk_count, total_vertices, total_indices
+                        "FPS: {:.2} | Loaded Chunks: {} | Pending Upload: {} | Generating: {}",
+                        fps,
+                        self.loaded_chunks.len(),
+                        self.pending_upload.len(),
+                        self.generating_chunks.len()
                     );
                     self.fps_frame_count = 0;
                     self.fps_last_instant = now;
@@ -786,7 +794,6 @@ impl ApplicationHandler for App {
                     )
                     .normalize();
 
-                    // Vulkan's coordinate system has Y pointing down.
                     let vk_fix = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0));
                     let view = Mat4::look_at_rh(
                         self.camera_position,
@@ -871,23 +878,26 @@ impl ApplicationHandler for App {
                         descriptor_set,
                     )
                     .unwrap();
+
                 for chunk_data in self.loaded_chunks.values() {
-                    builder
-                        .bind_vertex_buffers(
-                            0,
-                            (
-                                chunk_data.vertex_buffer.clone(),
-                                chunk_data.normal_buffer.clone(),
-                                chunk_data.texcoord_buffer.clone(),
-                            ),
-                        )
-                        .unwrap()
-                        .bind_index_buffer(chunk_data.index_buffer.clone())
+                    if chunk_data.index_buffer.len() > 0 {
+                        builder
+                            .bind_vertex_buffers(
+                                0,
+                                (
+                                    chunk_data.vertex_buffer.clone(),
+                                    chunk_data.normal_buffer.clone(),
+                                    chunk_data.texcoord_buffer.clone(),
+                                ),
+                            )
+                            .unwrap()
+                            .bind_index_buffer(chunk_data.index_buffer.clone())
+                            .unwrap();
+                        unsafe {
+                            builder.draw_indexed(chunk_data.index_buffer.len() as u32, 1, 0, 0, 0)
+                        }
                         .unwrap();
-                    unsafe {
-                        builder.draw_indexed(chunk_data.index_buffer.len() as u32, 1, 0, 0, 0)
                     }
-                    .unwrap();
                 }
 
                 builder.end_render_pass(Default::default()).unwrap();
@@ -955,13 +965,21 @@ impl ApplicationHandler for App {
             move_delta -= Vec3::Y;
         }
 
+        let mut camera_moved_chunks = false;
         if move_delta != Vec3::ZERO {
             self.camera_position += move_delta.normalize() * MOVE_SPEED;
             let current_chunk_coords = Self::get_chunk_coords_at(self.camera_position);
             if current_chunk_coords != self.last_camera_chunk_coords {
-                self.update_chunks();
+                camera_moved_chunks = true;
             }
         }
+
+        self.process_pending_uploads();
+
+        if camera_moved_chunks {
+            self.request_chunks_around_camera();
+        }
+
         if let Some(rcx) = self.rcx.as_mut() {
             rcx.window.request_redraw();
         }
