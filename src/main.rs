@@ -899,7 +899,7 @@ impl ApplicationHandler for App {
 
                 for chunk_data in self.loaded_chunks.values() {
                     if chunk_data.vertex_buffer.len() > 0 {
-                        let index_count = chunk_data.vertex_buffer.len() as u32 / 24 * 36;
+                        let index_count = chunk_data.vertex_buffer.len() as u32 / 2 * 3;
                         builder
                             .bind_vertex_buffers(0, (chunk_data.vertex_buffer.clone(),))
                             .unwrap();
