@@ -10,21 +10,11 @@ pub const CHUNK_HEIGHT: usize = 64;
 
 #[derive(BufferContents, Vertex, Clone, Copy, Debug)]
 #[repr(C)]
-pub struct Position {
+pub struct VertexData {
     #[format(R32G32B32_SFLOAT)]
     pub position: [f32; 3],
-}
-
-#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
-#[repr(C)]
-pub struct Normal {
     #[format(R32G32B32_SFLOAT)]
     pub normal: [f32; 3],
-}
-
-#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
-#[repr(C)]
-pub struct TexCoord {
     #[format(R32G32_SFLOAT)]
     pub tex_coord: [f32; 2],
 }
@@ -88,17 +78,10 @@ fn get_uv_region(tex_x: f32, tex_y: f32) -> [f32; 4] {
     [min_u, min_v, max_u, max_v]
 }
 
-pub fn generate_chunk_mesh(
-    chunk_coords: ChunkCoords,
-    world: &World,
-) -> (Vec<Position>, Vec<Normal>, Vec<TexCoord>, Vec<u32>) {
+pub fn generate_chunk_mesh(chunk_coords: ChunkCoords, world: &World) -> Vec<VertexData> {
     let chunk_data = world.get_chunk_blocks(chunk_coords).unwrap();
 
-    let mut positions = Vec::new();
-    let mut normals = Vec::new();
-    let mut tex_coords = Vec::new();
-    let mut indices = Vec::new();
-    let mut current_vertex_offset: u32 = 0;
+    let mut vertices = Vec::new();
 
     let stone_tex_coords = (TEXTURE_SIZE_PIXELS * 3.0, TEXTURE_SIZE_PIXELS * 0.0);
     let dirt_tex_coords = (TEXTURE_SIZE_PIXELS * 2.0, TEXTURE_SIZE_PIXELS * 0.0);
@@ -158,7 +141,6 @@ pub fn generate_chunk_mesh(
         Vec3::new(0.0, -1.0, 0.0),
     ];
 
-    let face_indices: [u32; 6] = [0, 1, 2, 0, 2, 3];
     let neighbor_offsets: [(i32, i32, i32); 6] = [
         (0, 0, 1),
         (0, 0, -1),
@@ -217,30 +199,20 @@ pub fn generate_chunk_mesh(
                         for i in 0..4 {
                             let data_idx = vertex_start_index_in_cube_data + i;
                             let world_pos = block_center + rel_vertices[data_idx];
-                            positions.push(Position {
-                                position: world_pos.to_array(),
-                            });
-                            normals.push(Normal {
-                                normal: normal.to_array(),
-                            });
-
                             let relative_uv = VERTEX_UVS[data_idx];
                             let final_u = region_min_u + relative_uv.x * region_width;
                             let final_v = region_min_v + relative_uv.y * region_height;
-                            tex_coords.push(TexCoord {
+                            vertices.push(VertexData {
+                                position: world_pos.to_array(),
+                                normal: normal.to_array(),
                                 tex_coord: [final_u, final_v],
                             });
                         }
-
-                        for idx in face_indices.iter() {
-                            indices.push(current_vertex_offset + idx);
-                        }
-                        current_vertex_offset += 4;
                     }
                 }
             }
         }
     }
 
-    (positions, normals, tex_coords, indices)
+    vertices
 }

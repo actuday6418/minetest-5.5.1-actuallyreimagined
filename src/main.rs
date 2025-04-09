@@ -69,12 +69,14 @@ mod world;
 mod worldgen;
 
 use world::{ChunkBlocks, ChunkCoords, World};
-use worldgen::{ATLAS_H, ATLAS_W, CHUNK_BREADTH, Normal, Position, TexCoord, generate_chunk_mesh};
+use worldgen::{ATLAS_H, ATLAS_W, CHUNK_BREADTH, CHUNK_HEIGHT, VertexData, generate_chunk_mesh};
 
 const MOUSE_SENSITIVITY: f32 = 0.01;
 const MOVE_SPEED: f32 = 0.5;
-const CHUNK_RADIUS: i32 = 25;
-const MAX_UPLOADS_PER_FRAME: usize = 100;
+const CHUNK_RADIUS: i32 = 30;
+const MAX_UPLOADS_PER_FRAME: usize = 20;
+const MAX_QUADS_PER_CHUNK: usize = CHUNK_BREADTH * CHUNK_BREADTH * CHUNK_HEIGHT * 6;
+const MAX_INDICES_PER_CHUNK: usize = MAX_QUADS_PER_CHUNK * 6;
 
 fn main() -> Result<(), impl Error> {
     let event_loop = EventLoop::new().unwrap();
@@ -84,17 +86,11 @@ fn main() -> Result<(), impl Error> {
 }
 
 struct ChunkData {
-    vertex_buffer: Subbuffer<[Position]>,
-    normal_buffer: Subbuffer<[Normal]>,
-    index_buffer: Subbuffer<[u32]>,
-    texcoord_buffer: Subbuffer<[TexCoord]>,
+    vertex_buffer: Subbuffer<[VertexData]>,
 }
 
 struct CpuMeshData {
-    positions: Vec<Position>,
-    normals: Vec<Normal>,
-    tex_coords: Vec<TexCoord>,
-    indices: Vec<u32>,
+    vertices: Vec<VertexData>,
 }
 
 type MeshGenResult = (ChunkCoords, CpuMeshData);
@@ -106,6 +102,7 @@ struct App {
     memory_allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+    shared_index_buffer: Subbuffer<[u32]>,
     world: Arc<RwLock<World>>,
     loaded_chunks: HashMap<ChunkCoords, ChunkData>,
     generating_chunks: HashSet<ChunkCoords>,
@@ -130,6 +127,7 @@ struct App {
     thread_pool: Arc<ThreadPool>,
     result_sender: Sender<MeshGenResult>,
     result_receiver: Receiver<MeshGenResult>,
+    all_uploads_next_frame: bool, // set this to trigger all uploads next frame, regardless of MAX_UPLOADS_PER_FRAME
 }
 
 struct RenderContext {
@@ -297,6 +295,71 @@ impl App {
         let (result_sender, result_receiver) = unbounded::<MeshGenResult>();
 
         let world = Arc::new(RwLock::new(World::new()));
+        let mut indices = Vec::with_capacity(MAX_INDICES_PER_CHUNK);
+        for i in 0..(MAX_QUADS_PER_CHUNK as u32) {
+            let base_vertex = i * 4;
+            indices.extend_from_slice(&[
+                base_vertex,
+                base_vertex + 1,
+                base_vertex + 2,
+                base_vertex + 2,
+                base_vertex + 3,
+                base_vertex,
+            ]);
+        }
+
+        let staging_index_buffer = Buffer::from_iter(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            indices,
+        )
+        .unwrap();
+
+        let shared_index_buffer = Buffer::new_slice(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+            MAX_INDICES_PER_CHUNK as u64,
+        )
+        .unwrap();
+
+        let mut upload_cb_builder = AutoCommandBufferBuilder::primary(
+            command_buffer_allocator.clone(),
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap();
+
+        upload_cb_builder
+            .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
+                staging_index_buffer.clone(),
+                shared_index_buffer.clone(),
+            ))
+            .unwrap();
+
+        let upload_cb = upload_cb_builder.build().unwrap();
+
+        let future = sync::now(device.clone())
+            .then_execute(queue.clone(), upload_cb)
+            .unwrap()
+            .then_signal_fence_and_flush()
+            .unwrap();
+
+        future.wait(None).unwrap();
 
         let mut app = App {
             instance,
@@ -307,6 +370,7 @@ impl App {
             memory_allocator,
             descriptor_set_allocator,
             command_buffer_allocator,
+            shared_index_buffer,
             world,
             loaded_chunks: HashMap::new(),
             generating_chunks: HashSet::new(),
@@ -326,6 +390,7 @@ impl App {
             is_moving_right: false,
             is_moving_up: false,
             is_moving_down: false,
+            all_uploads_next_frame: true,
             thread_pool,
             result_sender,
             result_receiver,
@@ -425,17 +490,12 @@ impl App {
                     }
                 }
 
-                let (positions, normals, tex_coords, indices) = {
+                let vertices = {
                     let world_reader = world_arc.read().unwrap();
                     generate_chunk_mesh(coord, &world_reader)
                 };
 
-                let cpu_mesh_data = CpuMeshData {
-                    positions,
-                    normals,
-                    tex_coords,
-                    indices,
-                };
+                let cpu_mesh_data = CpuMeshData { vertices };
 
                 let _ = result_sender.send((coord, cpu_mesh_data));
             });
@@ -456,7 +516,7 @@ impl App {
         let mut coords_uploaded = Vec::new();
 
         for (coord, cpu_data) in self.pending_upload.iter() {
-            if uploaded_count >= MAX_UPLOADS_PER_FRAME {
+            if uploaded_count >= MAX_UPLOADS_PER_FRAME && !self.all_uploads_next_frame {
                 break;
             }
 
@@ -479,58 +539,11 @@ impl App {
                         | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                     ..Default::default()
                 },
-                cpu_data.positions.clone(),
-            )
-            .unwrap();
-            let normal_buffer = Buffer::from_iter(
-                self.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::VERTEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                cpu_data.normals.clone(),
-            )
-            .unwrap();
-            let texcoord_buffer = Buffer::from_iter(
-                self.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::VERTEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                cpu_data.tex_coords.clone(),
-            )
-            .unwrap();
-            let index_buffer = Buffer::from_iter(
-                self.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::INDEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                cpu_data.indices.clone(),
+                cpu_data.vertices.clone(),
             )
             .unwrap();
 
-            let chunk_data = ChunkData {
-                vertex_buffer,
-                normal_buffer,
-                texcoord_buffer,
-                index_buffer,
-            };
+            let chunk_data = ChunkData { vertex_buffer };
 
             self.loaded_chunks.insert(*coord, chunk_data);
             coords_uploaded.push(*coord);
@@ -539,6 +552,9 @@ impl App {
 
         for coord in coords_uploaded {
             self.pending_upload.remove(&coord);
+        }
+        if self.all_uploads_next_frame {
+            self.all_uploads_next_frame = false;
         }
     }
 }
@@ -877,26 +893,17 @@ impl ApplicationHandler for App {
                         0,
                         descriptor_set,
                     )
+                    .unwrap()
+                    .bind_index_buffer(self.shared_index_buffer.clone())
                     .unwrap();
 
                 for chunk_data in self.loaded_chunks.values() {
-                    if chunk_data.index_buffer.len() > 0 {
+                    if chunk_data.vertex_buffer.len() > 0 {
+                        let index_count = chunk_data.vertex_buffer.len() as u32 / 24 * 36;
                         builder
-                            .bind_vertex_buffers(
-                                0,
-                                (
-                                    chunk_data.vertex_buffer.clone(),
-                                    chunk_data.normal_buffer.clone(),
-                                    chunk_data.texcoord_buffer.clone(),
-                                ),
-                            )
-                            .unwrap()
-                            .bind_index_buffer(chunk_data.index_buffer.clone())
+                            .bind_vertex_buffers(0, (chunk_data.vertex_buffer.clone(),))
                             .unwrap();
-                        unsafe {
-                            builder.draw_indexed(chunk_data.index_buffer.len() as u32, 1, 0, 0, 0)
-                        }
-                        .unwrap();
+                        unsafe { builder.draw_indexed(index_count, 1, 0, 0, 0) }.unwrap();
                     }
                 }
 
@@ -1028,13 +1035,7 @@ fn window_size_dependent_setup(
         .collect::<Vec<_>>();
 
     let pipeline = {
-        let vertex_input_state = [
-            Position::per_vertex(),
-            Normal::per_vertex(),
-            TexCoord::per_vertex(),
-        ]
-        .definition(vs)
-        .unwrap();
+        let vertex_input_state = VertexData::per_vertex().definition(vs).unwrap();
         let stages = [
             PipelineShaderStageCreateInfo::new(vs.clone()),
             PipelineShaderStageCreateInfo::new(fs.clone()),
