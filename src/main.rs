@@ -69,14 +69,15 @@ mod world;
 mod worldgen;
 
 use world::{ChunkBlocks, ChunkCoords, World};
-use worldgen::{ATLAS_H, ATLAS_W, CHUNK_BREADTH, CHUNK_HEIGHT, VertexData, generate_chunk_mesh};
+use worldgen::{
+    ATLAS_H, ATLAS_W, CHUNK_BREADTH, FaceData, QuadTemplateData, create_quad_templates,
+    generate_chunk_mesh,
+};
 
 const MOUSE_SENSITIVITY: f32 = 0.01;
 const MOVE_SPEED: f32 = 0.5;
-const CHUNK_RADIUS: i32 = 30;
+const CHUNK_RADIUS: i32 = 35;
 const MAX_UPLOADS_PER_FRAME: usize = 20;
-const MAX_QUADS_PER_CHUNK: usize = CHUNK_BREADTH * CHUNK_BREADTH * CHUNK_HEIGHT * 6;
-const MAX_INDICES_PER_CHUNK: usize = MAX_QUADS_PER_CHUNK * 6;
 
 fn main() -> Result<(), impl Error> {
     let event_loop = EventLoop::new().unwrap();
@@ -86,11 +87,11 @@ fn main() -> Result<(), impl Error> {
 }
 
 struct ChunkData {
-    vertex_buffer: Subbuffer<[VertexData]>,
+    face_buffer: Subbuffer<[FaceData]>,
 }
 
 struct CpuMeshData {
-    vertices: Vec<VertexData>,
+    faces: Vec<FaceData>,
 }
 
 type MeshGenResult = (ChunkCoords, CpuMeshData);
@@ -103,6 +104,7 @@ struct App {
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     shared_index_buffer: Subbuffer<[u32]>,
+    shared_quad_buffer: Arc<Buffer>,
     world: Arc<RwLock<World>>,
     loaded_chunks: HashMap<ChunkCoords, ChunkData>,
     generating_chunks: HashSet<ChunkCoords>,
@@ -295,20 +297,9 @@ impl App {
         let (result_sender, result_receiver) = unbounded::<MeshGenResult>();
 
         let world = Arc::new(RwLock::new(World::new()));
-        let mut indices = Vec::with_capacity(MAX_INDICES_PER_CHUNK);
-        for i in 0..(MAX_QUADS_PER_CHUNK as u32) {
-            let base_vertex = i * 4;
-            indices.extend_from_slice(&[
-                base_vertex,
-                base_vertex + 1,
-                base_vertex + 2,
-                base_vertex + 2,
-                base_vertex + 3,
-                base_vertex,
-            ]);
-        }
 
-        let staging_index_buffer = Buffer::from_iter(
+        let quad_template_data = create_quad_templates();
+        let staging_quad_buffer = Buffer::from_iter(
             memory_allocator.clone(),
             BufferCreateInfo {
                 usage: BufferUsage::TRANSFER_SRC,
@@ -319,21 +310,21 @@ impl App {
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
             },
-            indices,
+            quad_template_data,
         )
         .unwrap();
 
-        let shared_index_buffer = Buffer::new_slice(
+        let shared_quad_buffer = Buffer::new_slice::<QuadTemplateData>(
             memory_allocator.clone(),
             BufferCreateInfo {
-                usage: BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST,
+                usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
                 ..Default::default()
             },
             AllocationCreateInfo {
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
                 ..Default::default()
             },
-            MAX_INDICES_PER_CHUNK as u64,
+            staging_quad_buffer.len(),
         )
         .unwrap();
 
@@ -346,7 +337,62 @@ impl App {
 
         upload_cb_builder
             .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
-                staging_index_buffer.clone(),
+                staging_quad_buffer.clone(),
+                shared_quad_buffer.clone(),
+            ))
+            .unwrap();
+
+        let upload_cb = upload_cb_builder.build().unwrap();
+        let future = sync::now(device.clone())
+            .then_execute(queue.clone(), upload_cb)
+            .unwrap()
+            .then_signal_fence_and_flush()
+            .unwrap();
+
+        future.wait(None).unwrap();
+
+        let shared_quad_buffer = shared_quad_buffer.buffer().clone();
+
+        let indices: [u32; 6] = [0, 1, 2, 2, 3, 0];
+
+        let staging_index_buffer = Buffer::from_iter(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            indices.iter().cloned(),
+        )
+        .unwrap();
+
+        let shared_index_buffer: Subbuffer<[u32]> = Buffer::new_slice(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+            6,
+        )
+        .unwrap();
+
+        let mut upload_cb_builder = AutoCommandBufferBuilder::primary(
+            command_buffer_allocator.clone(),
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap();
+        upload_cb_builder
+            .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
+                staging_index_buffer,
                 shared_index_buffer.clone(),
             ))
             .unwrap();
@@ -371,6 +417,7 @@ impl App {
             descriptor_set_allocator,
             command_buffer_allocator,
             shared_index_buffer,
+            shared_quad_buffer,
             world,
             loaded_chunks: HashMap::new(),
             generating_chunks: HashSet::new(),
@@ -490,12 +537,12 @@ impl App {
                     }
                 }
 
-                let vertices = {
+                let faces = {
                     let world_reader = world_arc.read().unwrap();
                     generate_chunk_mesh(coord, &world_reader)
                 };
 
-                let cpu_mesh_data = CpuMeshData { vertices };
+                let cpu_mesh_data = CpuMeshData { faces };
 
                 let _ = result_sender.send((coord, cpu_mesh_data));
             });
@@ -528,7 +575,29 @@ impl App {
                 continue;
             }
 
-            let vertex_buffer = Buffer::from_iter(
+            if cpu_data.faces.is_empty() {
+                let face_buffer = Buffer::from_iter(
+                    self.memory_allocator.clone(),
+                    BufferCreateInfo {
+                        usage: BufferUsage::VERTEX_BUFFER,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                            | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                        ..Default::default()
+                    },
+                    std::iter::empty::<FaceData>(),
+                )
+                .unwrap();
+                let chunk_data = ChunkData { face_buffer };
+                self.loaded_chunks.insert(*coord, chunk_data);
+                coords_uploaded.push(*coord);
+                uploaded_count += 1;
+                continue;
+            }
+
+            let face_buffer = Buffer::from_iter(
                 self.memory_allocator.clone(),
                 BufferCreateInfo {
                     usage: BufferUsage::VERTEX_BUFFER,
@@ -539,17 +608,16 @@ impl App {
                         | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                     ..Default::default()
                 },
-                cpu_data.vertices.clone(),
+                cpu_data.faces.clone(),
             )
             .unwrap();
 
-            let chunk_data = ChunkData { vertex_buffer };
+            let chunk_data = ChunkData { face_buffer };
 
             self.loaded_chunks.insert(*coord, chunk_data);
             coords_uploaded.push(*coord);
             uploaded_count += 1;
         }
-
         for coord in coords_uploaded {
             self.pending_upload.remove(&coord);
         }
@@ -819,10 +887,9 @@ impl ApplicationHandler for App {
                     let sun = Vec3::new(0.48, 0.98, 0.78).normalize();
 
                     let uniform_data = vs::Data {
-                        world: Mat4::IDENTITY.to_cols_array_2d(),
                         view: view.to_cols_array_2d(),
                         proj: (vk_fix * proj).to_cols_array_2d(),
-                        sun: sun.to_array(),
+                        sun: sun.to_array().into(),
                     };
 
                     let buffer = self.uniform_buffer_allocator.allocate_sized().unwrap();
@@ -841,6 +908,7 @@ impl ApplicationHandler for App {
                             self.texture_view.clone(),
                             self.texture_sampler.clone(),
                         ),
+                        WriteDescriptorSet::buffer(2, self.shared_quad_buffer.clone().into()),
                     ],
                     [],
                 )
@@ -897,16 +965,36 @@ impl ApplicationHandler for App {
                     .bind_index_buffer(self.shared_index_buffer.clone())
                     .unwrap();
 
-                for chunk_data in self.loaded_chunks.values() {
-                    if chunk_data.vertex_buffer.len() > 0 {
-                        let index_count = chunk_data.vertex_buffer.len() as u32 / 2 * 3;
+                for (chunk_coords, chunk_data) in &self.loaded_chunks {
+                    if chunk_data.face_buffer.len() > 0 {
+                        let chunk_world_x = chunk_coords.0 as f32 * CHUNK_BREADTH as f32;
+                        let chunk_world_z = chunk_coords.1 as f32 * CHUNK_BREADTH as f32;
+                        let current_chunk_offset = Vec3::new(chunk_world_x, 0.0, chunk_world_z);
                         builder
-                            .bind_vertex_buffers(0, (chunk_data.vertex_buffer.clone(),))
+                            .push_constants(
+                                rcx.pipeline.layout().clone(),
+                                0,
+                                current_chunk_offset.to_array(),
+                            )
                             .unwrap();
-                        unsafe { builder.draw_indexed(index_count, 1, 0, 0, 0) }.unwrap();
+
+                        builder
+                            .bind_vertex_buffers(0, (chunk_data.face_buffer.clone(),))
+                            .unwrap();
+
+                        unsafe {
+                            builder
+                                .draw_indexed(
+                                    self.shared_index_buffer.len() as u32,
+                                    chunk_data.face_buffer.len() as u32,
+                                    0,
+                                    0,
+                                    0,
+                                )
+                                .unwrap()
+                        };
                     }
                 }
-
                 builder.end_render_pass(Default::default()).unwrap();
 
                 let command_buffer = builder.build().unwrap();
@@ -1035,7 +1123,7 @@ fn window_size_dependent_setup(
         .collect::<Vec<_>>();
 
     let pipeline = {
-        let vertex_input_state = VertexData::per_vertex().definition(vs).unwrap();
+        let vertex_input_state = FaceData::per_instance().definition(&vs).unwrap();
         let stages = [
             PipelineShaderStageCreateInfo::new(vs.clone()),
             PipelineShaderStageCreateInfo::new(fs.clone()),
