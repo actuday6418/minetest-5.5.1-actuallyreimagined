@@ -27,7 +27,7 @@ use vulkano::{
     },
     format::Format,
     image::{
-        Image, ImageCreateInfo, ImageType, ImageUsage, SampleCount,
+        Image, ImageCreateInfo, ImageLayout, ImageType, ImageUsage, SampleCount,
         sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
         view::ImageView,
     },
@@ -79,6 +79,7 @@ const MOVE_SPEED: f32 = 0.5;
 const CHUNK_RADIUS: i32 = 35;
 const MAX_UPLOADS_PER_FRAME: usize = 20;
 const MSAA_SAMPLES: SampleCount = SampleCount::Sample2;
+const MAX_MIP_LEVELS: u32 = 11;
 
 fn main() -> Result<(), impl Error> {
     let event_loop = EventLoop::new().unwrap();
@@ -160,7 +161,6 @@ impl App {
             },
         )
         .unwrap();
-
         let device_extensions = DeviceExtensions {
             khr_swapchain: true,
             ..DeviceExtensions::empty()
@@ -229,7 +229,8 @@ impl App {
                 image_type: ImageType::Dim2d,
                 format: Format::R8G8B8A8_UNORM,
                 extent: [ATLAS_W as u32, ATLAS_H as u32, 1],
-                usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+                usage: ImageUsage::TRANSFER_DST | ImageUsage::TRANSFER_SRC | ImageUsage::SAMPLED,
+                mip_levels: MAX_MIP_LEVELS,
                 ..Default::default()
             },
             AllocationCreateInfo::default(),
@@ -240,9 +241,10 @@ impl App {
             device.clone(),
             SamplerCreateInfo {
                 mag_filter: Filter::Nearest,
-                min_filter: Filter::Nearest,
-                mipmap_mode: vulkano::image::sampler::SamplerMipmapMode::Nearest,
+                min_filter: Filter::Linear,
+                mipmap_mode: vulkano::image::sampler::SamplerMipmapMode::Linear,
                 address_mode: [SamplerAddressMode::ClampToEdge; 3],
+                lod: 0.0..=(MAX_MIP_LEVELS - 1) as f32,
                 ..Default::default()
             },
         )
@@ -275,6 +277,39 @@ impl App {
                 ),
             )
             .unwrap();
+        let mut src_width = ATLAS_W as u32;
+        let mut src_height = ATLAS_H as u32;
+
+        for mip_level in 0..(MAX_MIP_LEVELS - 1) {
+            let dst_width = (src_width / 2).max(1);
+            let dst_height = (src_height / 2).max(1);
+
+            let mut blit_info = vulkano::command_buffer::BlitImageInfo::images(
+                texture_image.clone(),
+                texture_image.clone(),
+            );
+
+            let region = vulkano::command_buffer::ImageBlit {
+                src_subresource: vulkano::image::ImageSubresourceLayers {
+                    mip_level,
+                    ..texture_image.subresource_layers()
+                },
+                src_offsets: [[0, 0, 0], [src_width, src_height, 1]],
+                dst_subresource: vulkano::image::ImageSubresourceLayers {
+                    mip_level: mip_level + 1,
+                    ..texture_image.subresource_layers()
+                },
+                dst_offsets: [[0, 0, 0], [dst_width, dst_height, 1]],
+                ..Default::default()
+            };
+
+            blit_info.regions = smallvec::smallvec![region];
+            blit_info.filter = Filter::Linear;
+            upload_cb_builder.blit_image(blit_info).unwrap();
+
+            src_width = dst_width;
+            src_height = dst_height;
+        }
         let upload_cb = upload_cb_builder.build().unwrap();
         let future = sync::now(device.clone())
             .then_execute(queue.clone(), upload_cb)
