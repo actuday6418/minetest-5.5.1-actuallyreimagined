@@ -2,7 +2,8 @@ use crate::world::{ChunkCoords, World};
 use glam::{Vec2, Vec3};
 use vulkano::{buffer::BufferContents, pipeline::graphics::vertex_input::Vertex};
 
-const TEXTURE_SIZE_PIXELS: f32 = 16.0;
+const TEXTURE_SIZE_PIXELS: f32 = 18.0;
+const TEXTURE_PADDING_PIXELS: f32 = 1.0;
 pub const ATLAS_W: f32 = 1024.0;
 pub const ATLAS_H: f32 = 1024.0;
 pub const CHUNK_BREADTH: usize = 16;
@@ -58,10 +59,22 @@ fn get_block_face_quad_index(block_type: BlockType, face_index: usize) -> u32 {
 pub fn create_quad_templates() -> Vec<QuadTemplateData> {
     let mut templates = Vec::new();
 
-    let stone_tex_coords = (TEXTURE_SIZE_PIXELS * 3.0, TEXTURE_SIZE_PIXELS * 0.0);
-    let dirt_tex_coords = (TEXTURE_SIZE_PIXELS * 2.0, TEXTURE_SIZE_PIXELS * 0.0);
-    let grass_top_tex_coords = (TEXTURE_SIZE_PIXELS * 1.0, TEXTURE_SIZE_PIXELS * 0.0);
-    let grass_side_tex_coords = (TEXTURE_SIZE_PIXELS * 0.0, TEXTURE_SIZE_PIXELS * 0.0);
+    let stone_tex_coords = (
+        TEXTURE_SIZE_PIXELS * 3.0 + 1.0,
+        TEXTURE_SIZE_PIXELS * 0.0 + 1.0,
+    );
+    let dirt_tex_coords = (
+        TEXTURE_SIZE_PIXELS * 2.0 + 1.0,
+        TEXTURE_SIZE_PIXELS * 0.0 + 1.0,
+    );
+    let grass_top_tex_coords = (
+        TEXTURE_SIZE_PIXELS * 1.0 + 1.0,
+        TEXTURE_SIZE_PIXELS * 0.0 + 1.0,
+    );
+    let grass_side_tex_coords = (
+        TEXTURE_SIZE_PIXELS * 0.0 + 1.0,
+        TEXTURE_SIZE_PIXELS * 0.0 + 1.0,
+    );
 
     let stone_region = get_uv_region(stone_tex_coords.0, stone_tex_coords.1);
     let dirt_region = get_uv_region(dirt_tex_coords.0, dirt_tex_coords.1);
@@ -178,8 +191,8 @@ pub fn create_quad_templates() -> Vec<QuadTemplateData> {
 fn get_uv_region(tex_x: f32, tex_y: f32) -> [f32; 4] {
     let min_u = tex_x / ATLAS_W;
     let min_v = tex_y / ATLAS_H;
-    let max_u = (tex_x + TEXTURE_SIZE_PIXELS) / ATLAS_W;
-    let max_v = (tex_y + TEXTURE_SIZE_PIXELS) / ATLAS_H;
+    let max_u = (tex_x + TEXTURE_SIZE_PIXELS - 2.0 * TEXTURE_PADDING_PIXELS) / ATLAS_W;
+    let max_v = (tex_y + TEXTURE_SIZE_PIXELS - 2.0 * TEXTURE_PADDING_PIXELS) / ATLAS_H;
 
     [min_u, min_v, max_u, max_v]
 }

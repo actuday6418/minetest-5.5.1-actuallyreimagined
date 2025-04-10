@@ -219,7 +219,7 @@ impl App {
             Default::default(),
         ));
 
-        let image = image::open(Path::new("assets/atlas.png"))
+        let image = image::open(Path::new("assets/atlas_padded.png"))
             .expect("Failed to open texture file")
             .to_rgba8();
         let image_data = image.into_raw();
