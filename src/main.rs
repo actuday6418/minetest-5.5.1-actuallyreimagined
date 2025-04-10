@@ -27,7 +27,7 @@ use vulkano::{
     },
     format::Format,
     image::{
-        Image, ImageCreateInfo, ImageType, ImageUsage,
+        Image, ImageCreateInfo, ImageType, ImageUsage, SampleCount,
         sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
         view::ImageView,
     },
@@ -78,6 +78,7 @@ const MOUSE_SENSITIVITY: f32 = 0.01;
 const MOVE_SPEED: f32 = 0.5;
 const CHUNK_RADIUS: i32 = 35;
 const MAX_UPLOADS_PER_FRAME: usize = 20;
+const MSAA_SAMPLES: SampleCount = SampleCount::Sample2;
 
 fn main() -> Result<(), impl Error> {
     let event_loop = EventLoop::new().unwrap();
@@ -135,6 +136,8 @@ struct App {
 struct RenderContext {
     window: Arc<Window>,
     swapchain: Arc<Swapchain>,
+    msaa_color_image: Arc<ImageView>,
+    msaa_depth_image: Arc<ImageView>,
     render_pass: Arc<RenderPass>,
     framebuffers: Vec<Arc<Framebuffer>>,
     vs: EntryPoint,
@@ -656,7 +659,7 @@ impl ApplicationHandler for App {
                     min_image_count: surface_capabilities.min_image_count.max(2),
                     image_format,
                     image_extent: window_size.into(),
-                    image_usage: ImageUsage::COLOR_ATTACHMENT,
+                    image_usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_DST,
                     composite_alpha: surface_capabilities
                         .supported_composite_alpha
                         .into_iter()
@@ -671,21 +674,28 @@ impl ApplicationHandler for App {
         let render_pass = vulkano::single_pass_renderpass!(
             self.device.clone(),
             attachments: {
-                color: {
+                msaa_color: {
+                    format: swapchain.image_format(),
+                    samples: MSAA_SAMPLES,
+                    load_op: Clear,
+                    store_op: DontCare,
+                },
+                final_color: {
                     format: swapchain.image_format(),
                     samples: 1,
-                    load_op: Clear,
+                    load_op: DontCare,
                     store_op: Store,
                 },
                 depth_stencil: {
-                    format: Format::D16_UNORM,
-                    samples: 1,
+                    format: Format::D32_SFLOAT,
+                    samples: MSAA_SAMPLES,
                     load_op: Clear,
                     store_op: DontCare,
                 },
             },
             pass: {
-                color: [color],
+                color: [msaa_color],
+                color_resolve: [final_color],
                 depth_stencil: {depth_stencil},
             },
         )
@@ -700,20 +710,23 @@ impl ApplicationHandler for App {
             .entry_point("main")
             .unwrap();
 
-        let (framebuffers, pipeline) = window_size_dependent_setup(
-            window_size,
-            &images,
-            &render_pass,
-            &self.memory_allocator,
-            &vs,
-            &fs,
-        );
+        let (framebuffers, pipeline, msaa_color_image, msaa_depth_image) =
+            window_size_dependent_setup(
+                window_size,
+                &images,
+                &render_pass,
+                &self.memory_allocator,
+                &vs,
+                &fs,
+            );
 
         let previous_frame_end = Some(sync::now(self.device.clone()).boxed());
 
         self.rcx = Some(RenderContext {
             window,
             swapchain,
+            msaa_color_image,
+            msaa_depth_image,
             render_pass,
             framebuffers,
             vs,
@@ -849,7 +862,12 @@ impl ApplicationHandler for App {
                         };
 
                     rcx.swapchain = new_swapchain;
-                    (rcx.framebuffers, rcx.pipeline) = window_size_dependent_setup(
+                    (
+                        rcx.framebuffers,
+                        rcx.pipeline,
+                        rcx.msaa_color_image,
+                        rcx.msaa_depth_image,
+                    ) = window_size_dependent_setup(
                         window_size,
                         &new_images,
                         &rcx.render_pass,
@@ -944,6 +962,7 @@ impl ApplicationHandler for App {
                         RenderPassBeginInfo {
                             clear_values: vec![
                                 Some([0.6, 0.8, 1.0, 1.0].into()),
+                                None,
                                 Some(1f32.into()),
                             ],
                             ..RenderPassBeginInfo::framebuffer(
@@ -1088,17 +1107,39 @@ fn window_size_dependent_setup(
     memory_allocator: &Arc<StandardMemoryAllocator>,
     vs: &EntryPoint,
     fs: &EntryPoint,
-) -> (Vec<Arc<Framebuffer>>, Arc<GraphicsPipeline>) {
+) -> (
+    Vec<Arc<Framebuffer>>,
+    Arc<GraphicsPipeline>,
+    Arc<ImageView>,
+    Arc<ImageView>,
+) {
     let device = memory_allocator.device();
-
-    let depth_buffer = ImageView::new_default(
+    let msaa_color_image = ImageView::new_default(
         Image::new(
             memory_allocator.clone(),
             ImageCreateInfo {
                 image_type: ImageType::Dim2d,
-                format: Format::D16_UNORM,
+                format: images[0].format(),
+                extent: images[0].extent(),
+                usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
+                samples: MSAA_SAMPLES,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let msaa_depth_image = ImageView::new_default(
+        Image::new(
+            memory_allocator.clone(),
+            ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: Format::D32_SFLOAT,
                 extent: images[0].extent(),
                 usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
+                samples: MSAA_SAMPLES,
                 ..Default::default()
             },
             AllocationCreateInfo::default(),
@@ -1110,11 +1151,15 @@ fn window_size_dependent_setup(
     let framebuffers = images
         .iter()
         .map(|image| {
-            let view = ImageView::new_default(image.clone()).unwrap();
+            let final_view = ImageView::new_default(image.clone()).unwrap();
             Framebuffer::new(
                 render_pass.clone(),
                 FramebufferCreateInfo {
-                    attachments: vec![view, depth_buffer.clone()],
+                    attachments: vec![
+                        msaa_color_image.clone(),
+                        final_view,
+                        msaa_depth_image.clone(),
+                    ],
                     ..Default::default()
                 },
             )
@@ -1163,7 +1208,10 @@ fn window_size_dependent_setup(
                     depth: Some(DepthState::simple()),
                     ..Default::default()
                 }),
-                multisample_state: Some(MultisampleState::default()),
+                multisample_state: Some(MultisampleState {
+                    rasterization_samples: MSAA_SAMPLES,
+                    ..Default::default()
+                }),
                 color_blend_state: Some(ColorBlendState::with_attachment_states(
                     subpass.num_color_attachments(),
                     ColorBlendAttachmentState::default(),
@@ -1175,7 +1223,7 @@ fn window_size_dependent_setup(
         .unwrap()
     };
 
-    (framebuffers, pipeline)
+    (framebuffers, pipeline, msaa_color_image, msaa_depth_image)
 }
 
 mod vs {
