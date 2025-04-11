@@ -27,7 +27,7 @@ use vulkano::{
     },
     format::Format,
     image::{
-        Image, ImageCreateInfo, ImageLayout, ImageType, ImageUsage, SampleCount,
+        Image, ImageCreateInfo, ImageType, ImageUsage, SampleCount,
         sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
         view::ImageView,
     },
