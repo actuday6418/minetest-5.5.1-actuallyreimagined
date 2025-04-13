@@ -65,18 +65,20 @@ use winit::{
     window::{Window, WindowId},
 };
 
+mod frustum;
 mod world;
 mod worldgen;
 
+use frustum::{Aabb, Frustum};
 use world::{ChunkBlocks, ChunkCoords, World};
 use worldgen::{
-    ATLAS_H, ATLAS_W, CHUNK_BREADTH, FaceData, QuadTemplateData, create_quad_templates,
-    generate_chunk_mesh,
+    ATLAS_H, ATLAS_W, CHUNK_BREADTH, CHUNK_HEIGHT, FaceData, QuadTemplateData,
+    create_quad_templates, generate_chunk_mesh,
 };
 
 const MOUSE_SENSITIVITY: f32 = 0.01;
 const MOVE_SPEED: f32 = 0.5;
-const CHUNK_RADIUS: i32 = 35;
+const CHUNK_RADIUS: i32 = 25;
 const MAX_UPLOADS_PER_FRAME: usize = 20;
 const MSAA_SAMPLES: SampleCount = SampleCount::Sample2;
 const MAX_MIP_LEVELS: u32 = 11;
@@ -89,7 +91,7 @@ fn main() -> Result<(), impl Error> {
 }
 
 struct ChunkData {
-    face_buffer: Subbuffer<[FaceData]>,
+    face_buffer: Option<Subbuffer<[FaceData]>>,
 }
 
 struct CpuMeshData {
@@ -110,6 +112,8 @@ struct App {
     world: Arc<RwLock<World>>,
     loaded_chunks: HashMap<ChunkCoords, ChunkData>,
     generating_chunks: HashSet<ChunkCoords>,
+    meshing_chunks: HashSet<ChunkCoords>,
+    pending_neighbor_check: HashSet<ChunkCoords>,
     pending_upload: HashMap<ChunkCoords, CpuMeshData>,
     texture_view: Arc<ImageView>,
     texture_sampler: Arc<Sampler>,
@@ -131,7 +135,10 @@ struct App {
     thread_pool: Arc<ThreadPool>,
     result_sender: Sender<MeshGenResult>,
     result_receiver: Receiver<MeshGenResult>,
+    gen_block_sender: Sender<(ChunkCoords, Arc<ChunkBlocks>)>,
+    gen_block_receiver: Receiver<(ChunkCoords, Arc<ChunkBlocks>)>,
     all_uploads_next_frame: bool, // set this to trigger all uploads next frame, regardless of MAX_UPLOADS_PER_FRAME
+    current_frustum: Frustum,
 }
 
 struct RenderContext {
@@ -161,14 +168,17 @@ impl App {
             },
         )
         .unwrap();
-        let device_extensions = DeviceExtensions {
+        let enabled_extensions = DeviceExtensions {
             khr_swapchain: true,
             ..DeviceExtensions::empty()
         };
         let (physical_device, queue_family_index) = instance
             .enumerate_physical_devices()
             .unwrap()
-            .filter(|p| p.supported_extensions().contains(&device_extensions))
+            .filter(|p| {
+                p.supported_extensions().contains(&enabled_extensions)
+                    && p.supported_features().sampler_anisotropy
+            })
             .filter_map(|p| {
                 p.queue_family_properties()
                     .iter()
@@ -195,10 +205,15 @@ impl App {
             physical_device.properties().device_type,
         );
 
+        let enabled_features = vulkano::device::DeviceFeatures {
+            sampler_anisotropy: true,
+            ..vulkano::device::DeviceFeatures::empty()
+        };
         let (device, mut queues) = Device::new(
             physical_device,
             DeviceCreateInfo {
-                enabled_extensions: device_extensions,
+                enabled_extensions,
+                enabled_features,
                 queue_create_infos: vec![QueueCreateInfo {
                     queue_family_index,
                     ..Default::default()
@@ -244,6 +259,7 @@ impl App {
                 min_filter: Filter::Linear,
                 mipmap_mode: vulkano::image::sampler::SamplerMipmapMode::Linear,
                 address_mode: [SamplerAddressMode::ClampToEdge; 3],
+                anisotropy: Some(8.0),
                 lod: 0.0..=(MAX_MIP_LEVELS - 1) as f32,
                 ..Default::default()
             },
@@ -328,11 +344,12 @@ impl App {
             },
         );
 
-        let initial_camera_position = Vec3::new(0.0, 20.0, 0.0);
-        let initial_chunk_coords = Self::get_chunk_coords_at(initial_camera_position);
+        let camera_position = Vec3::new(0.0, 0.0, 0.0);
+        let initial_chunk_coords = Self::get_chunk_coords_at(camera_position);
 
         let thread_pool = Arc::new(ThreadPoolBuilder::new().num_threads(12).build().unwrap());
         let (result_sender, result_receiver) = unbounded::<MeshGenResult>();
+        let (gen_block_sender, gen_block_receiver) = unbounded::<(ChunkCoords, Arc<ChunkBlocks>)>();
 
         let world = Arc::new(RwLock::new(World::new()));
 
@@ -445,6 +462,8 @@ impl App {
 
         future.wait(None).unwrap();
 
+        let current_frustum = Frustum::from_view_proj(&Mat4::ZERO);
+
         let mut app = App {
             instance,
             device,
@@ -460,11 +479,13 @@ impl App {
             loaded_chunks: HashMap::new(),
             generating_chunks: HashSet::new(),
             pending_upload: HashMap::new(),
+            pending_neighbor_check: HashSet::new(),
+            meshing_chunks: HashSet::new(),
             texture_view,
             texture_sampler,
             uniform_buffer_allocator,
             rcx: None,
-            camera_position: initial_camera_position,
+            camera_position,
             last_camera_chunk_coords: initial_chunk_coords,
             yaw: -std::f32::consts::FRAC_PI_2,
             pitch: -0.0,
@@ -479,6 +500,9 @@ impl App {
             thread_pool,
             result_sender,
             result_receiver,
+            gen_block_sender,
+            gen_block_receiver,
+            current_frustum,
         };
 
         app.request_chunks_around_camera();
@@ -511,6 +535,12 @@ impl App {
             .union(&current_pending_coords)
             .cloned()
             .collect::<HashSet<_>>()
+            .union(&self.pending_neighbor_check)
+            .cloned()
+            .collect::<HashSet<_>>()
+            .union(&self.meshing_chunks)
+            .cloned()
+            .collect::<HashSet<_>>()
             .union(&self.generating_chunks)
             .cloned()
             .collect::<HashSet<_>>();
@@ -526,6 +556,8 @@ impl App {
             self.loaded_chunks.remove(&coord);
             self.pending_upload.remove(&coord);
             self.generating_chunks.remove(&coord);
+            self.meshing_chunks.remove(&coord);
+            self.pending_neighbor_check.remove(&coord);
 
             for (dx, dz) in DIRECT_NEIGHBOR_OFFSETS {
                 let neighbor_coord = (coord.0 + dx, coord.1 + dz);
@@ -546,11 +578,15 @@ impl App {
             self.loaded_chunks.remove(&coord_to_remesh);
             self.pending_upload.remove(&coord_to_remesh);
             self.generating_chunks.remove(&coord_to_remesh);
+            self.meshing_chunks.remove(&coord_to_remesh);
+            self.pending_neighbor_check.remove(&coord_to_remesh);
             coords_to_generate.insert(coord_to_remesh);
         }
 
         for coord in coords_to_generate {
             if self.generating_chunks.contains(&coord)
+                || self.meshing_chunks.contains(&coord)
+                || self.pending_neighbor_check.contains(&coord)
                 || self.pending_upload.contains_key(&coord)
                 || self.loaded_chunks.contains_key(&coord)
             {
@@ -558,40 +594,93 @@ impl App {
             }
             self.generating_chunks.insert(coord);
 
-            let world_arc = self.world.clone();
             let pool = self.thread_pool.clone();
-            let result_sender = self.result_sender.clone();
+            let gen_block_sender = self.gen_block_sender.clone();
 
             pool.spawn(move || {
-                let chunk_blocks = ChunkBlocks::generate(coord);
-
-                {
-                    let mut world_writer = world_arc.write().unwrap();
-                    world_writer.insert_chunk_blocks(coord, Arc::new(chunk_blocks));
-
-                    for (dx, dz) in DIRECT_NEIGHBOR_OFFSETS {
-                        let neighbor_coord = (coord.0 + dx, coord.1 + dz);
-                        world_writer.ensure_chunk_generated(neighbor_coord);
-                    }
-                }
-
-                let faces = {
-                    let world_reader = world_arc.read().unwrap();
-                    generate_chunk_mesh(coord, &world_reader)
-                };
-
-                let cpu_mesh_data = CpuMeshData { faces };
-
-                let _ = result_sender.send((coord, cpu_mesh_data));
+                let chunk_blocks = Arc::new(ChunkBlocks::generate(coord));
+                let _ = gen_block_sender.send((coord, chunk_blocks));
             });
         }
         self.last_camera_chunk_coords = camera_coords;
     }
 
-    fn process_pending_uploads(&mut self) {
+    fn process_block_generation(&mut self) {
+        const DIRECT_NEIGHBOR_OFFSETS: [(i32, i32); 4] = [(0, 1), (0, -1), (1, 0), (-1, 0)];
+
+        while let Ok((coord, chunk_blocks)) = self.gen_block_receiver.try_recv() {
+            if self.generating_chunks.remove(&coord) {
+                {
+                    let mut world_writer = self.world.write().unwrap();
+                    world_writer.insert_chunk_blocks(coord, chunk_blocks);
+                }
+                self.pending_neighbor_check.insert(coord);
+
+                self.try_schedule_mesh(coord);
+
+                for (dx, dz) in DIRECT_NEIGHBOR_OFFSETS {
+                    let neighbor_coord = (coord.0 + dx, coord.1 + dz);
+
+                    self.try_schedule_mesh(neighbor_coord);
+                }
+            }
+        }
+    }
+
+    fn try_schedule_mesh(&mut self, coord: ChunkCoords) {
+        const DIRECT_NEIGHBOR_OFFSETS: [(i32, i32); 4] = [(0, 1), (0, -1), (1, 0), (-1, 0)];
+
+        if !self.pending_neighbor_check.contains(&coord) {
+            return;
+        }
+
+        let all_neighbors_ready = {
+            let world_reader = self.world.read().unwrap();
+            let mut ready = true;
+            for (dx, dz) in DIRECT_NEIGHBOR_OFFSETS {
+                let neighbor_coord = (coord.0 + dx, coord.1 + dz);
+
+                if !world_reader.chunk_exists(neighbor_coord) {
+                    ready = false;
+                    break;
+                }
+            }
+            ready
+        };
+
+        if all_neighbors_ready {
+            if self.pending_neighbor_check.remove(&coord) {
+                self.meshing_chunks.insert(coord);
+
+                let world_arc = self.world.clone();
+                let pool = self.thread_pool.clone();
+                let result_sender = self.result_sender.clone();
+
+                pool.spawn(move || {
+                    let faces = {
+                        let world_reader = world_arc.read().unwrap();
+
+                        generate_chunk_mesh(coord, &world_reader)
+                    };
+
+                    let cpu_mesh_data = CpuMeshData { faces };
+                    let _ = result_sender.send((coord, cpu_mesh_data));
+                });
+            }
+        }
+    }
+
+    fn process_mesh_generation(&mut self) {
         while let Ok((coords, cpu_mesh_data)) = self.result_receiver.try_recv() {
-            if self.generating_chunks.remove(&coords) {
-                if !self.loaded_chunks.contains_key(&coords) {
+            if self.meshing_chunks.remove(&coords) {
+                let camera_coords = Self::get_chunk_coords_at(self.camera_position);
+                let dx = (coords.0 - camera_coords.0).abs();
+                let dz = (coords.1 - camera_coords.1).abs();
+
+                if dx <= CHUNK_RADIUS
+                    && dz <= CHUNK_RADIUS
+                    && !self.loaded_chunks.contains_key(&coords)
+                {
                     self.pending_upload.insert(coords, cpu_mesh_data);
                 }
             }
@@ -614,7 +703,15 @@ impl App {
             }
 
             if cpu_data.faces.is_empty() {
-                let face_buffer = Buffer::from_iter(
+                let chunk_data = ChunkData { face_buffer: None };
+                self.loaded_chunks.insert(*coord, chunk_data);
+                coords_uploaded.push(*coord);
+                uploaded_count += 1;
+                continue;
+            }
+
+            let face_buffer = Some(
+                Buffer::from_iter(
                     self.memory_allocator.clone(),
                     BufferCreateInfo {
                         usage: BufferUsage::VERTEX_BUFFER,
@@ -625,30 +722,10 @@ impl App {
                             | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                         ..Default::default()
                     },
-                    std::iter::empty::<FaceData>(),
+                    cpu_data.faces.clone(),
                 )
-                .unwrap();
-                let chunk_data = ChunkData { face_buffer };
-                self.loaded_chunks.insert(*coord, chunk_data);
-                coords_uploaded.push(*coord);
-                uploaded_count += 1;
-                continue;
-            }
-
-            let face_buffer = Buffer::from_iter(
-                self.memory_allocator.clone(),
-                BufferCreateInfo {
-                    usage: BufferUsage::VERTEX_BUFFER,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                        | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                    ..Default::default()
-                },
-                cpu_data.faces.clone(),
-            )
-            .unwrap();
+                .unwrap(),
+            );
 
             let chunk_data = ChunkData { face_buffer };
 
@@ -913,35 +990,32 @@ impl ApplicationHandler for App {
                     rcx.recreate_swapchain = false;
                 }
 
+                let aspect_ratio =
+                    rcx.swapchain.image_extent()[0] as f32 / rcx.swapchain.image_extent()[1] as f32;
+
+                let forward = Vec3::new(
+                    self.yaw.cos() * self.pitch.cos(),
+                    self.pitch.sin(),
+                    self.yaw.sin() * self.pitch.cos(),
+                )
+                .normalize();
+
+                let vk_fix = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0));
+                let view = Mat4::look_at_rh(
+                    self.camera_position,
+                    self.camera_position + forward,
+                    Vec3::Y,
+                );
+
+                let proj =
+                    Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, aspect_ratio, 0.1, 2000.0);
+                let vk_fixed_proj = vk_fix * proj;
+
+                let sun = Vec3::new(0.48, 0.98, 0.78).normalize();
                 let uniform_buffer = {
-                    let aspect_ratio = rcx.swapchain.image_extent()[0] as f32
-                        / rcx.swapchain.image_extent()[1] as f32;
-
-                    let proj = Mat4::perspective_rh(
-                        std::f32::consts::FRAC_PI_2,
-                        aspect_ratio,
-                        0.1,
-                        2000.0,
-                    );
-
-                    let forward = Vec3::new(
-                        self.yaw.cos() * self.pitch.cos(),
-                        self.pitch.sin(),
-                        self.yaw.sin() * self.pitch.cos(),
-                    )
-                    .normalize();
-
-                    let vk_fix = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0));
-                    let view = Mat4::look_at_rh(
-                        self.camera_position,
-                        self.camera_position + forward,
-                        Vec3::Y,
-                    );
-                    let sun = Vec3::new(0.48, 0.98, 0.78).normalize();
-
                     let uniform_data = vs::Data {
                         view: view.to_cols_array_2d(),
-                        proj: (vk_fix * proj).to_cols_array_2d(),
+                        proj: vk_fixed_proj.to_cols_array_2d(),
                         sun: sun.to_array().into(),
                     };
 
@@ -949,6 +1023,8 @@ impl ApplicationHandler for App {
                     *buffer.write().unwrap() = uniform_data;
                     buffer
                 };
+
+                self.current_frustum = Frustum::from_view_proj(&(vk_fixed_proj * view));
 
                 let layout = &rcx.pipeline.layout().set_layouts()[0];
                 let descriptor_set = DescriptorSet::new(
@@ -1020,33 +1096,44 @@ impl ApplicationHandler for App {
                     .unwrap();
 
                 for (chunk_coords, chunk_data) in &self.loaded_chunks {
-                    if chunk_data.face_buffer.len() > 0 {
+                    if let Some(face_buff) = &chunk_data.face_buffer {
                         let chunk_world_x = chunk_coords.0 as f32 * CHUNK_BREADTH as f32;
                         let chunk_world_z = chunk_coords.1 as f32 * CHUNK_BREADTH as f32;
-                        let current_chunk_offset = Vec3::new(chunk_world_x, 0.0, chunk_world_z);
-                        builder
-                            .push_constants(
-                                rcx.pipeline.layout().clone(),
-                                0,
-                                current_chunk_offset.to_array(),
-                            )
-                            .unwrap();
 
-                        builder
-                            .bind_vertex_buffers(0, (chunk_data.face_buffer.clone(),))
-                            .unwrap();
-
-                        unsafe {
-                            builder
-                                .draw_indexed(
-                                    self.shared_index_buffer.len() as u32,
-                                    chunk_data.face_buffer.len() as u32,
-                                    0,
-                                    0,
-                                    0,
-                                )
-                                .unwrap()
+                        let chunk_aabb = Aabb {
+                            min: Vec3::new(chunk_world_x, 0.0, chunk_world_z),
+                            max: Vec3::new(
+                                chunk_world_x + CHUNK_BREADTH as f32,
+                                CHUNK_HEIGHT as f32,
+                                chunk_world_z + CHUNK_BREADTH as f32,
+                            ),
                         };
+                        if self.current_frustum.intersects_aabb(&chunk_aabb) {
+                            let current_chunk_offset = Vec3::new(chunk_world_x, 0.0, chunk_world_z);
+                            builder
+                                .push_constants(
+                                    rcx.pipeline.layout().clone(),
+                                    0,
+                                    current_chunk_offset.to_array(),
+                                )
+                                .unwrap();
+
+                            builder
+                                .bind_vertex_buffers(0, (face_buff.clone(),))
+                                .unwrap();
+
+                            unsafe {
+                                builder
+                                    .draw_indexed(
+                                        self.shared_index_buffer.len() as u32,
+                                        face_buff.len() as u32,
+                                        0,
+                                        0,
+                                        0,
+                                    )
+                                    .unwrap()
+                            };
+                        }
                     }
                 }
                 builder.end_render_pass(Default::default()).unwrap();
@@ -1123,7 +1210,8 @@ impl ApplicationHandler for App {
             }
         }
 
-        self.process_pending_uploads();
+        self.process_block_generation();
+        self.process_mesh_generation();
 
         if camera_moved_chunks {
             self.request_chunks_around_camera();

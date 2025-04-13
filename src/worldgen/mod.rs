@@ -7,7 +7,7 @@ const TEXTURE_PADDING_PIXELS: f32 = 1.0;
 pub const ATLAS_W: f32 = 1024.0;
 pub const ATLAS_H: f32 = 1024.0;
 pub const CHUNK_BREADTH: usize = 16;
-pub const CHUNK_HEIGHT: usize = 64;
+pub const CHUNK_HEIGHT: usize = 250;
 
 #[derive(BufferContents, Clone, Copy, Debug)]
 #[repr(C, align(16))]
@@ -20,8 +20,8 @@ pub struct QuadTemplateData {
 #[derive(BufferContents, Vertex, Clone, Copy, Debug)]
 #[repr(C)]
 pub struct FaceData {
-    #[format(R32G32B32_UINT)]
-    pub block_position: [u32; 3],
+    #[format(R8G8B8_UINT)]
+    pub block_position: [u8; 3],
     #[format(R32_UINT)]
     pub quad_index: u32,
 }
@@ -235,15 +235,15 @@ pub fn generate_chunk_mesh(chunk_coords: ChunkCoords, world: &World) -> Vec<Face
                     let neighbor_gy = gy + offset.1;
                     let neighbor_gz = gz + offset.2;
 
-                    let neighbor_is_opaque = world
-                        .get_block(neighbor_gx, neighbor_gy, neighbor_gz)
-                        .map_or(false, |neighbor_type| neighbor_type.is_opaque());
+                    let neighbor_block = world.get_block(neighbor_gx, neighbor_gy, neighbor_gz);
+
+                    let neighbor_is_opaque =
+                        neighbor_block.map_or(false, |neighbor_type| neighbor_type.is_opaque());
 
                     if !neighbor_is_opaque {
                         let quad_index = get_block_face_quad_index(*block_type, face_index);
-
                         faces.push(FaceData {
-                            block_position: [lx as u32, ly as u32, lz as u32],
+                            block_position: [lx as u8, ly as u8, lz as u8],
                             quad_index,
                         });
                     }
