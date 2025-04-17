@@ -1,6 +1,6 @@
 use crate::frustum::{Aabb, Frustum};
-use crate::world::{ChunkBlocks, ChunkCoords, World};
-use crate::worldgen::{CHUNK_BREADTH, CHUNK_HEIGHT, FaceData, generate_chunk_mesh};
+use crate::world::{CHUNK_BREADTH, CHUNK_HEIGHT, ChunkBlocks, ChunkCoords, World};
+use crate::worldgen::{FaceData, generate_chunk_mesh};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use glam::{Vec2, f32::Vec3};
 use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -189,12 +189,16 @@ impl ChunkManager {
                 let world_arc = self.world.clone();
                 let mesh_sender = self.mesh_result_sender.clone();
 
-                self.thread_pool.spawn(move || {
-                    let faces = {
-                        let world_reader = world_arc.read().unwrap();
+                let neighborhood = {
+                    let world_reader = world_arc.read().unwrap();
+                    world_reader
+                        .get_chunk_neighborhood(coord)
+                        .expect("Neighbors checked but neighborhood fetch failed")
+                };
 
-                        generate_chunk_mesh(coord, &world_reader)
-                    };
+                self.thread_pool.spawn(move || {
+                    let faces = generate_chunk_mesh(&neighborhood);
+
                     let cpu_mesh_data = CpuMeshData { faces };
                     if mesh_sender.send((coord, cpu_mesh_data)).is_err() {
                         log::error!("Mesh result channel closed for {:?}", coord);

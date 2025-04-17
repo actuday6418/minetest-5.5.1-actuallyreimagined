@@ -1,4 +1,4 @@
-use crate::world::{ChunkCoords, World};
+use crate::world::{BlockType, CHUNK_BREADTH, CHUNK_HEIGHT, ChunkNeighborhood};
 use bytemuck::{Pod, Zeroable};
 use glam::{Vec2, Vec3};
 
@@ -6,8 +6,6 @@ const TEXTURE_SIZE_PIXELS: f32 = 18.0;
 const TEXTURE_PADDING_PIXELS: f32 = 1.0;
 pub const ATLAS_W: f32 = 1024.0;
 pub const ATLAS_H: f32 = 1024.0;
-pub const CHUNK_BREADTH: usize = 16;
-pub const CHUNK_HEIGHT: usize = 250;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -45,22 +43,6 @@ impl FaceData {
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
-pub enum BlockType {
-    _Water,
-    Dirt,
-    Grass,
-    Stone,
-}
-
-impl BlockType {
-    pub fn is_opaque(&self) -> bool {
-        match self {
-            BlockType::_Water => false,
-            _ => true,
-        }
-    }
-}
 const STONE_FACE_QUADS_START: u32 = 0;
 const DIRT_FACE_QUADS_START: u32 = 6;
 const GRASS_FACE_QUADS_START: u32 = 12;
@@ -215,17 +197,8 @@ fn get_uv_region(tex_x: f32, tex_y: f32) -> [f32; 4] {
     [min_u, min_v, max_u, max_v]
 }
 
-pub fn generate_chunk_mesh(chunk_coords: ChunkCoords, world: &World) -> Vec<FaceData> {
-    let chunk_data = match world.get_chunk_blocks(chunk_coords) {
-        Some(data) => data,
-        None => {
-            log::error!(
-                "Tried to generate mesh for non-existent chunk blocks: {:?}",
-                chunk_coords
-            );
-            return Vec::new();
-        }
-    };
+pub fn generate_chunk_mesh(world: &ChunkNeighborhood) -> Vec<FaceData> {
+    let chunk_coords = world.get_center_coords();
 
     let mut faces = Vec::new();
 
@@ -243,7 +216,11 @@ pub fn generate_chunk_mesh(chunk_coords: ChunkCoords, world: &World) -> Vec<Face
     for lx in 0..CHUNK_BREADTH {
         for ly in 0..CHUNK_HEIGHT {
             for lz in 0..CHUNK_BREADTH {
-                let block_type = match chunk_data.get_local_block(lx, ly, lz) {
+                let block_type = match world.get_block(
+                    chunk_origin_x + lx as i32,
+                    ly as i32,
+                    chunk_origin_z + lz as i32,
+                ) {
                     Some(bt) => bt,
                     None => continue,
                 };

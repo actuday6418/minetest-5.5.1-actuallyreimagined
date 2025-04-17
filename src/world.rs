@@ -1,14 +1,32 @@
-use crate::worldgen::{BlockType, CHUNK_BREADTH, CHUNK_HEIGHT};
 use noise::{Fbm, MultiFractal, NoiseFn, Perlin};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 pub type ChunkCoords = (i32, i32);
-pub type LocalBlockCoords = (usize, usize, usize);
+
+pub const CHUNK_BREADTH: usize = 16;
+pub const CHUNK_HEIGHT: usize = 250;
 
 #[derive(Clone)]
 pub struct ChunkBlocks {
-    blocks: [[[Option<BlockType>; CHUNK_BREADTH]; CHUNK_HEIGHT]; CHUNK_BREADTH],
+    blocks: [[[Option<BlockType>; CHUNK_HEIGHT]; CHUNK_BREADTH]; CHUNK_BREADTH],
+}
+
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum BlockType {
+    _Water,
+    Dirt,
+    Grass,
+    Stone,
+}
+
+impl BlockType {
+    pub fn is_opaque(&self) -> bool {
+        match self {
+            BlockType::_Water => false,
+            _ => true,
+        }
+    }
 }
 
 enum BiomeType {
@@ -20,7 +38,7 @@ enum BiomeType {
 impl ChunkBlocks {
     fn new_empty() -> Self {
         Self {
-            blocks: [[[None; CHUNK_BREADTH]; CHUNK_HEIGHT]; CHUNK_BREADTH],
+            blocks: [[[None; CHUNK_HEIGHT]; CHUNK_BREADTH]; CHUNK_BREADTH],
         }
     }
 
@@ -139,33 +157,33 @@ impl ChunkBlocks {
                     }
 
                     if is_cave_air {
-                        chunk.blocks[x][y][z] = None;
+                        chunk.blocks[x][z][y] = None;
                     } else if final_density > DENSITY_THRESHOLD {
-                        chunk.blocks[x][y][z] = Some(BlockType::Stone);
+                        chunk.blocks[x][z][y] = Some(BlockType::Stone);
                     } else {
-                        chunk.blocks[x][y][z] = None;
+                        chunk.blocks[x][z][y] = None;
                     }
                 }
 
                 let dirt_depth = 3;
 
                 for y in (0..CHUNK_HEIGHT).rev() {
-                    let current_block = chunk.blocks[x][y][z];
+                    let current_block = chunk.blocks[x][z][y];
 
                     let block_above = if y == CHUNK_HEIGHT - 1 {
                         None
                     } else {
-                        chunk.blocks[x][y + 1][z]
+                        chunk.blocks[x][z][y + 1]
                     };
 
                     if current_block == Some(BlockType::Stone) && block_above.is_none() {
-                        chunk.blocks[x][y][z] = Some(BlockType::Grass);
+                        chunk.blocks[x][z][y] = Some(BlockType::Grass);
 
                         for d in 1..=dirt_depth {
                             if y >= d {
                                 let below_idx = y - d;
-                                if chunk.blocks[x][below_idx][z] == Some(BlockType::Stone) {
-                                    chunk.blocks[x][below_idx][z] = Some(BlockType::Dirt);
+                                if chunk.blocks[x][z][below_idx] == Some(BlockType::Stone) {
+                                    chunk.blocks[x][z][below_idx] = Some(BlockType::Dirt);
                                 } else {
                                     break;
                                 }
@@ -178,11 +196,11 @@ impl ChunkBlocks {
                     }
                 }
 
-                if chunk.blocks[x][0][z].is_none()
-                    || chunk.blocks[x][0][z] == Some(BlockType::Grass)
-                    || chunk.blocks[x][0][z] == Some(BlockType::Dirt)
+                if chunk.blocks[x][z][0].is_none()
+                    || chunk.blocks[x][z][0] == Some(BlockType::Grass)
+                    || chunk.blocks[x][z][0] == Some(BlockType::Dirt)
                 {
-                    chunk.blocks[x][0][z] = Some(BlockType::Stone);
+                    chunk.blocks[x][z][0] = Some(BlockType::Stone);
                 }
             }
         }
@@ -191,7 +209,53 @@ impl ChunkBlocks {
 
     #[inline]
     pub fn get_local_block(&self, x: usize, y: usize, z: usize) -> Option<&BlockType> {
-        self.blocks[x][y][z].as_ref()
+        self.blocks[x][z][y].as_ref()
+    }
+}
+
+#[derive(Clone)]
+pub struct ChunkNeighborhood {
+    center_coords: ChunkCoords,
+    center: Arc<ChunkBlocks>,
+    north: Arc<ChunkBlocks>,
+    south: Arc<ChunkBlocks>,
+    east: Arc<ChunkBlocks>,
+    west: Arc<ChunkBlocks>,
+}
+
+impl ChunkNeighborhood {
+    #[inline]
+    pub fn get_block(&self, gx: i32, gy: i32, gz: i32) -> Option<&BlockType> {
+        if !(0..CHUNK_HEIGHT as i32).contains(&gy) {
+            return None;
+        }
+        let ly = gy as usize;
+        let target_cx = gx.div_euclid(CHUNK_BREADTH as i32);
+        let target_cz = gz.div_euclid(CHUNK_BREADTH as i32);
+        let target_coord = (target_cx, target_cz);
+
+        let lx = gx.rem_euclid(CHUNK_BREADTH as i32) as usize;
+        let lz = gz.rem_euclid(CHUNK_BREADTH as i32) as usize;
+
+        let chunk_data = if target_coord == self.center_coords {
+            &self.center
+        } else if target_coord == (self.center_coords.0, self.center_coords.1 + 1) {
+            &self.north
+        } else if target_coord == (self.center_coords.0, self.center_coords.1 - 1) {
+            &self.south
+        } else if target_coord == (self.center_coords.0 + 1, self.center_coords.1) {
+            &self.east
+        } else if target_coord == (self.center_coords.0 - 1, self.center_coords.1) {
+            &self.west
+        } else {
+            return None;
+        };
+
+        chunk_data.get_local_block(lx, ly, lz)
+    }
+
+    pub fn get_center_coords(&self) -> ChunkCoords {
+        self.center_coords
     }
 }
 
@@ -218,40 +282,37 @@ impl World {
         self.chunks.contains_key(&coords)
     }
 
-    pub fn get_chunk_blocks(&self, coords: ChunkCoords) -> Option<Arc<ChunkBlocks>> {
+    pub fn _get_chunk_blocks(&self, coords: ChunkCoords) -> Option<Arc<ChunkBlocks>> {
         self.chunks.get(&coords).cloned()
     }
 
-    #[inline]
-    pub fn global_to_chunk_local(
-        gx: i32,
-        gy: i32,
-        gz: i32,
-    ) -> Option<(ChunkCoords, LocalBlockCoords)> {
-        if !(0..CHUNK_HEIGHT as i32).contains(&gy) {
-            return None;
-        }
+    /// Attempts to retrieve the block data for a central chunk and its four direct
+    /// neighbors (+X, -X, +Z, -Z).
+    ///
+    /// Returns `Some(ChunkNeighborhood)` if the central chunk and all four neighbors
+    /// exist in the world, otherwise returns `None`.
+    ///
+    /// This should be called *after* verifying that neighbors are ready for meshing.
+    pub fn get_chunk_neighborhood(&self, center_coords: ChunkCoords) -> Option<ChunkNeighborhood> {
+        let (cx, cz) = center_coords;
+        let north_coords = (cx, cz + 1);
+        let south_coords = (cx, cz - 1);
+        let east_coords = (cx + 1, cz);
+        let west_coords = (cx - 1, cz);
 
-        let cx = gx.div_euclid(CHUNK_BREADTH as i32);
-        let cz = gz.div_euclid(CHUNK_BREADTH as i32);
+        let center = self.chunks.get(&center_coords)?;
+        let north = self.chunks.get(&north_coords)?;
+        let south = self.chunks.get(&south_coords)?;
+        let east = self.chunks.get(&east_coords)?;
+        let west = self.chunks.get(&west_coords)?;
 
-        let lx = gx.rem_euclid(CHUNK_BREADTH as i32) as usize;
-        let ly = gy as usize;
-        let lz = gz.rem_euclid(CHUNK_BREADTH as i32) as usize;
-
-        Some(((cx, cz), (lx, ly, lz)))
-    }
-
-    #[inline]
-    pub fn get_block(&self, gx: i32, gy: i32, gz: i32) -> Option<&BlockType> {
-        if let Some((chunk_coords, local_coords)) = Self::global_to_chunk_local(gx, gy, gz) {
-            if let Some(chunk_arc) = self.chunks.get(&chunk_coords) {
-                chunk_arc.get_local_block(local_coords.0, local_coords.1, local_coords.2)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+        Some(ChunkNeighborhood {
+            center_coords,
+            center: Arc::clone(center),
+            north: Arc::clone(north),
+            south: Arc::clone(south),
+            east: Arc::clone(east),
+            west: Arc::clone(west),
+        })
     }
 }
