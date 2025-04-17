@@ -1,6 +1,6 @@
 use crate::world::{ChunkCoords, World};
+use bytemuck::{Pod, Zeroable};
 use glam::{Vec2, Vec3};
-use vulkano::{buffer::BufferContents, pipeline::graphics::vertex_input::Vertex};
 
 const TEXTURE_SIZE_PIXELS: f32 = 18.0;
 const TEXTURE_PADDING_PIXELS: f32 = 1.0;
@@ -9,21 +9,40 @@ pub const ATLAS_H: f32 = 1024.0;
 pub const CHUNK_BREADTH: usize = 16;
 pub const CHUNK_HEIGHT: usize = 250;
 
-#[derive(BufferContents, Clone, Copy, Debug)]
-#[repr(C, align(16))]
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct QuadTemplateData {
-    pub model_positions: [[f32; 4]; 4], // relative to block center. Ignore extra f32 for padding.
+    pub model_positions: [[f32; 4]; 4],
     pub uvs: [[f32; 2]; 4],
-    pub normal: [f32; 4], // ignore extra f32 for padding
+    pub normal: [f32; 4],
 }
 
-#[derive(BufferContents, Vertex, Clone, Copy, Debug)]
 #[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct FaceData {
-    #[format(R8G8B8_UINT)]
-    pub block_position: [u8; 3],
-    #[format(R32_UINT)]
+    pub block_position: [u8; 4],
     pub quad_index: u32,
+}
+
+impl FaceData {
+    pub fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<FaceData>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Uint8x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[u8; 4]>() as wgpu::BufferAddress,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Uint32,
+                },
+            ],
+        }
+    }
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -127,15 +146,14 @@ pub fn create_quad_templates() -> Vec<QuadTemplateData> {
     ];
 
     let face_normals = [
-        Vec3::new(0.0, 0.0, 1.0),  // Front +Z
-        Vec3::new(0.0, 0.0, -1.0), // Back -Z
-        Vec3::new(-1.0, 0.0, 0.0), // Left -X
-        Vec3::new(1.0, 0.0, 0.0),  // Right +X
-        Vec3::new(0.0, 1.0, 0.0),  // Top +Y
-        Vec3::new(0.0, -1.0, 0.0), // Bottom -Y
+        Vec3::new(0.0, 0.0, 1.0),
+        Vec3::new(0.0, 0.0, -1.0),
+        Vec3::new(-1.0, 0.0, 0.0),
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(0.0, -1.0, 0.0),
     ];
 
-    // (Bottom-Left, Bottom-Right, Top-Right, Top-Left)
     let base_uvs = [
         Vec2::new(0.0, 1.0),
         Vec2::new(1.0, 1.0),
@@ -146,8 +164,8 @@ pub fn create_quad_templates() -> Vec<QuadTemplateData> {
     let create_template = |face_idx: usize, region: [f32; 4]| -> QuadTemplateData {
         let mut model_positions = [[0.0; 4]; 4];
         let mut uvs = [[0.0; 2]; 4];
-        let [x, y, z] = face_normals[face_idx].to_array();
-        let normal = [x, y, z, 0.0];
+        let normal_vec3 = face_normals[face_idx];
+        let normal = [normal_vec3.x, normal_vec3.y, normal_vec3.z, 0.0]; // Pad to vec4
 
         let region_min_u = region[0];
         let region_min_v = region[1];
@@ -156,8 +174,8 @@ pub fn create_quad_templates() -> Vec<QuadTemplateData> {
 
         for i in 0..4 {
             let vertex_index_in_cube_data = face_idx * 4 + i;
-            model_positions[i][0..3]
-                .copy_from_slice(&rel_vertices[vertex_index_in_cube_data].to_array());
+            let pos_vec3 = rel_vertices[vertex_index_in_cube_data];
+            model_positions[i] = [pos_vec3.x, pos_vec3.y, pos_vec3.z, 0.0];
 
             let base_uv = base_uvs[i];
             uvs[i] = [
@@ -198,7 +216,16 @@ fn get_uv_region(tex_x: f32, tex_y: f32) -> [f32; 4] {
 }
 
 pub fn generate_chunk_mesh(chunk_coords: ChunkCoords, world: &World) -> Vec<FaceData> {
-    let chunk_data = world.get_chunk_blocks(chunk_coords).unwrap();
+    let chunk_data = match world.get_chunk_blocks(chunk_coords) {
+        Some(data) => data,
+        None => {
+            log::error!(
+                "Tried to generate mesh for non-existent chunk blocks: {:?}",
+                chunk_coords
+            );
+            return Vec::new();
+        }
+    };
 
     let mut faces = Vec::new();
 
@@ -243,7 +270,7 @@ pub fn generate_chunk_mesh(chunk_coords: ChunkCoords, world: &World) -> Vec<Face
                     if !neighbor_is_opaque {
                         let quad_index = get_block_face_quad_index(*block_type, face_index);
                         faces.push(FaceData {
-                            block_position: [lx as u8, ly as u8, lz as u8],
+                            block_position: [lx as u8, ly as u8, lz as u8, 0],
                             quad_index,
                         });
                     }

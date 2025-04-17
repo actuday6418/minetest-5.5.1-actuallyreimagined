@@ -210,6 +210,10 @@ impl World {
         self.chunks.insert(coords, blocks);
     }
 
+    pub fn remove_chunk_blocks(&mut self, coords: &ChunkCoords) -> Option<Arc<ChunkBlocks>> {
+        self.chunks.remove(coords)
+    }
+
     pub fn chunk_exists(&self, coords: ChunkCoords) -> bool {
         self.chunks.contains_key(&coords)
     }
