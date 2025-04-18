@@ -722,7 +722,7 @@ impl ApplicationHandler for App {
                 if self.is_focused {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::KeyW) | PhysicalKey::Code(KeyCode::ArrowUp) => {
-                            self.move_direction.z = if is_pressed { 1.0 } else { 0.0 } // Or handle release more carefully
+                            self.move_direction.z = if is_pressed { 1.0 } else { 0.0 }
                         }
                         PhysicalKey::Code(KeyCode::KeyS)
                         | PhysicalKey::Code(KeyCode::ArrowDown) => {
