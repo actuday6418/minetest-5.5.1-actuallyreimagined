@@ -12,13 +12,23 @@ pub const ATLAS_H: f32 = 1024.0;
 pub struct QuadTemplateData {
     pub model_positions: [[f32; 4]; 4],
     pub uvs: [[f32; 2]; 4],
-    pub normal: [f32; 4],
+    pub normal_index: u32,
+    pub _padding: [u32; 3],
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct FaceData {
-    pub block_position: [u8; 4],
+    // Bit structure:
+    // 0-7:   Local X position (origin of quad)
+    // 8-15:  Local Y position (origin of quad)
+    // 16-23: Local Z position (origin of quad)
+    // 24-27: U scale - 1 (Width,  0 -> 1 block, 15 -> 16 blocks)
+    // 28-31: V scale - 1 (Height, 0 -> 1 block, 15 -> 16 blocks)
+    //
+    // Note: The axis represented by U and V depends on the face normal.
+    //  e.g., for +Z face: U=X, V=Y
+    pub packed_data: u32,
     pub quad_index: u32,
 }
 
@@ -31,10 +41,10 @@ impl FaceData {
                 wgpu::VertexAttribute {
                     offset: 0,
                     shader_location: 0,
-                    format: wgpu::VertexFormat::Uint8x4,
+                    format: wgpu::VertexFormat::Uint32,
                 },
                 wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[u8; 4]>() as wgpu::BufferAddress,
+                    offset: std::mem::size_of::<u32>() as wgpu::BufferAddress,
                     shader_location: 1,
                     format: wgpu::VertexFormat::Uint32,
                 },
@@ -127,15 +137,6 @@ pub fn create_quad_templates() -> Vec<QuadTemplateData> {
         Vec3::new(-H, -H, H),
     ];
 
-    let face_normals = [
-        Vec3::new(0.0, 0.0, 1.0),
-        Vec3::new(0.0, 0.0, -1.0),
-        Vec3::new(-1.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(0.0, 1.0, 0.0),
-        Vec3::new(0.0, -1.0, 0.0),
-    ];
-
     let base_uvs = [
         Vec2::new(0.0, 1.0),
         Vec2::new(1.0, 1.0),
@@ -146,8 +147,7 @@ pub fn create_quad_templates() -> Vec<QuadTemplateData> {
     let create_template = |face_idx: usize, region: [f32; 4]| -> QuadTemplateData {
         let mut model_positions = [[0.0; 4]; 4];
         let mut uvs = [[0.0; 2]; 4];
-        let normal_vec3 = face_normals[face_idx];
-        let normal = [normal_vec3.x, normal_vec3.y, normal_vec3.z, 0.0]; // Pad to vec4
+        let normal_index = face_idx as u32;
 
         let region_min_u = region[0];
         let region_min_v = region[1];
@@ -169,7 +169,8 @@ pub fn create_quad_templates() -> Vec<QuadTemplateData> {
         QuadTemplateData {
             model_positions,
             uvs,
-            normal,
+            normal_index,
+            _padding: [0, 0, 0],
         }
     };
 
@@ -246,8 +247,20 @@ pub fn generate_chunk_mesh(world: &ChunkNeighborhood) -> Vec<FaceData> {
 
                     if !neighbor_is_opaque {
                         let quad_index = get_block_face_quad_index(*block_type, face_index);
+
+                        let x = lx as u32;
+                        let y = ly as u32;
+                        let z = lz as u32;
+                        let u_scale_minus_1 = 0u32;
+                        let v_scale_minus_1 = 0u32;
+                        let packed_data = x
+                            | (y << 8)
+                            | (z << 16)
+                            | (u_scale_minus_1 << 24)
+                            | (v_scale_minus_1 << 28);
+
                         faces.push(FaceData {
-                            block_position: [lx as u8, ly as u8, lz as u8, 0],
+                            packed_data,
                             quad_index,
                         });
                     }

@@ -6,7 +6,7 @@ struct Uniforms {
 struct QuadTemplate {
     model_positions: array<vec4<f32>, 4>, 
     uvs: array<vec2<f32>, 4>,
-    normal: vec4<f32>, 
+    normal_index: u32, 
 };
 
 struct PushConstants {
@@ -19,7 +19,7 @@ struct QuadBuffer {
 };
 
 struct VertexInput {
-    @location(0) block_position: vec4<u32>, 
+    @location(0) packed_data: u32,
     @location(1) quad_index: u32,
 };
 
@@ -48,13 +48,42 @@ fn vs_main(
 
     let quad: QuadTemplate = quad_buffer.data[instance.quad_index];
 
-    let model_pos: vec3<f32> = quad.model_positions[quad_corner_index].xyz; 
-    let uv: vec2<f32> = quad.uvs[quad_corner_index]; 
-    let normal: vec3<f32> = quad.normal.xyz;
-  
-    let block_offset_local = vec3<f32>(f32(instance.block_position.x), f32(instance.block_position.y), f32(instance.block_position.z));
+    let packed = instance.packed_data;
+    let block_offset_local_x = f32(packed & 0xFFu);
+    let block_offset_local_y = f32((packed >> 8u) & 0xFFu);
+    let block_offset_local_z = f32((packed >> 16u) & 0xFFu);
+    let u_scale_minus_1 = (packed >> 24u) & 0xFu;
+    let v_scale_minus_1 = (packed >> 28u) & 0xFu;
+
+    let u_scale = f32(u_scale_minus_1 + 1u);
+    let v_scale = f32(v_scale_minus_1 + 1u);
+    let block_offset_local = vec3<f32>(block_offset_local_x, block_offset_local_y, block_offset_local_z);
     
-    let world_pos = push_constants.chunk_offset_world + block_offset_local + vec3(0.5) + model_pos;
+    let normal_idx = quad.normal_index;
+    var normal: vec3<f32>;
+    var scale_vector: vec3<f32>;
+
+    
+    if (normal_idx == 0u) {
+        normal = vec3(1.0, 0.0, 0.0); scale_vector = vec3(1.0, v_scale, u_scale);
+    } else if (normal_idx == 1u) {
+        normal = vec3(-1.0, 0.0, 0.0); scale_vector = vec3(1.0, v_scale, u_scale);
+    } else if (normal_idx == 2u) {
+        normal = vec3(0.0, 1.0, 0.0); scale_vector = vec3(u_scale, 1.0, v_scale);
+    } else if (normal_idx == 3u) {
+        normal = vec3(0.0, -1.0, 0.0); scale_vector = vec3(u_scale, 1.0, v_scale);
+    } else if (normal_idx == 4u) {
+        normal = vec3(0.0, 0.0, 1.0); scale_vector = vec3(u_scale, v_scale, 1.0);
+    } else {
+        normal = vec3(0.0, 0.0, -1.0); scale_vector = vec3(u_scale, v_scale, 1.0);
+    } 
+ 
+    let base_model_pos: vec3<f32> = quad.model_positions[quad_corner_index].xyz;
+    let uv: vec2<f32> = quad.uvs[quad_corner_index];
+    let model_pos_01 = base_model_pos + vec3(0.5);
+    let scaled_pos_0scale = model_pos_01 * scale_vector;
+    let final_local_pos = block_offset_local + scaled_pos_0scale;
+    let world_pos = push_constants.chunk_offset_world + final_local_pos;
 
     var out: VertexOutput;
     out.clip_position = uniforms.view_proj * vec4<f32>(world_pos, 1.0);
