@@ -1,4 +1,4 @@
-use crate::world::{BlockType, CHUNK_BREADTH, CHUNK_HEIGHT, ChunkNeighborhood};
+use crate::world::{BlockType, CHUNK_SIZE, ChunkNeighborhood};
 use bytemuck::{Pod, Zeroable};
 use glam::{Vec2, Vec3};
 
@@ -211,12 +211,12 @@ pub fn generate_chunk_mesh(world: &ChunkNeighborhood) -> Vec<FaceData> {
         (0, 1, 0),
         (0, -1, 0),
     ];
-    let chunk_origin_x = chunk_coords.0 * CHUNK_BREADTH as i32;
-    let chunk_origin_z = chunk_coords.1 * CHUNK_BREADTH as i32;
+    let chunk_origin_x = chunk_coords.0 * CHUNK_SIZE as i32;
+    let chunk_origin_z = chunk_coords.1 * CHUNK_SIZE as i32;
 
-    for lx in 0..CHUNK_BREADTH {
-        for ly in 0..CHUNK_HEIGHT {
-            for lz in 0..CHUNK_BREADTH {
+    for lx in 0..CHUNK_SIZE {
+        for ly in 0..CHUNK_SIZE {
+            for lz in 0..CHUNK_SIZE {
                 let block_type = match world.get_block(
                     chunk_origin_x + lx as i32,
                     ly as i32,

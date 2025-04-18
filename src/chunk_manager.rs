@@ -1,5 +1,5 @@
 use crate::frustum::{Aabb, Frustum};
-use crate::world::{CHUNK_BREADTH, CHUNK_HEIGHT, ChunkBlocks, ChunkCoords, World};
+use crate::world::{CHUNK_SIZE, ChunkBlocks, ChunkCoords, World};
 use crate::worldgen::{FaceData, generate_chunk_mesh};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use glam::{Vec2, f32::Vec3};
@@ -101,9 +101,9 @@ impl ChunkManager {
             })
             .map(move |(coords, gpu_data)| {
                 let chunk_center_x =
-                    coords.0 as f32 * CHUNK_BREADTH as f32 + (CHUNK_BREADTH as f32 / 2.0);
+                    coords.0 as f32 * CHUNK_SIZE as f32 + (CHUNK_SIZE as f32 / 2.0);
                 let chunk_center_z =
-                    coords.1 as f32 * CHUNK_BREADTH as f32 + (CHUNK_BREADTH as f32 / 2.0);
+                    coords.1 as f32 * CHUNK_SIZE as f32 + (CHUNK_SIZE as f32 / 2.0);
                 let dist_sq =
                     camera_pos_xz.distance_squared(Vec2::new(chunk_center_x, chunk_center_z));
                 (coords, gpu_data, dist_sq)
@@ -307,21 +307,21 @@ impl ChunkManager {
     #[inline]
     fn get_chunk_coords_at(position: Vec3) -> ChunkCoords {
         (
-            (position.x / CHUNK_BREADTH as f32).floor() as i32,
-            (position.z / CHUNK_BREADTH as f32).floor() as i32,
+            (position.x / CHUNK_SIZE as f32).floor() as i32,
+            (position.z / CHUNK_SIZE as f32).floor() as i32,
         )
     }
 
     #[inline]
     fn chunk_aabb_from_coords(coords: ChunkCoords) -> Aabb {
-        let chunk_world_x = coords.0 as f32 * CHUNK_BREADTH as f32;
-        let chunk_world_z = coords.1 as f32 * CHUNK_BREADTH as f32;
+        let chunk_world_x = coords.0 as f32 * CHUNK_SIZE as f32;
+        let chunk_world_z = coords.1 as f32 * CHUNK_SIZE as f32;
         Aabb {
             min: Vec3::new(chunk_world_x, 0.0, chunk_world_z),
             max: Vec3::new(
-                chunk_world_x + CHUNK_BREADTH as f32,
-                CHUNK_HEIGHT as f32,
-                chunk_world_z + CHUNK_BREADTH as f32,
+                chunk_world_x + CHUNK_SIZE as f32,
+                CHUNK_SIZE as f32,
+                chunk_world_z + CHUNK_SIZE as f32,
             ),
         }
     }

@@ -24,12 +24,12 @@ mod world;
 mod worldgen;
 
 use frustum::Frustum;
-use world::{CHUNK_BREADTH, ChunkCoords, World};
+use world::{CHUNK_SIZE, ChunkCoords, World};
 use worldgen::{FaceData, create_quad_templates};
 
 const MOUSE_SENSITIVITY: f32 = 0.01;
 const MOVE_SPEED: f32 = 0.5;
-const CHUNK_RADIUS: i32 = 35;
+const CHUNK_RADIUS: i32 = 10;
 const MAX_UPLOADS_PER_FRAME: usize = 20;
 const MSAA_SAMPLES: u32 = 4;
 const MAX_MIP_LEVELS: u32 = 11;
@@ -617,8 +617,8 @@ impl App {
             for (chunk_coords, data, _dist_sq) in visible_chunks {
                 if let Some(face_buffer) = &data.face_buffer {
                     if data.face_count > 0 {
-                        let chunk_world_x = chunk_coords.0 as f32 * CHUNK_BREADTH as f32;
-                        let chunk_world_z = chunk_coords.1 as f32 * CHUNK_BREADTH as f32;
+                        let chunk_world_x = chunk_coords.0 as f32 * CHUNK_SIZE as f32;
+                        let chunk_world_z = chunk_coords.1 as f32 * CHUNK_SIZE as f32;
                         let current_chunk_offset = Vec3::new(chunk_world_x, 0.0, chunk_world_z);
 
                         let push_constants = ChunkPushConstants {

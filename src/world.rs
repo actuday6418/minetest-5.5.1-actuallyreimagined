@@ -4,12 +4,11 @@ use std::sync::Arc;
 
 pub type ChunkCoords = (i32, i32);
 
-pub const CHUNK_BREADTH: usize = 16;
-pub const CHUNK_HEIGHT: usize = 250;
+pub const CHUNK_SIZE: usize = 64;
 
 #[derive(Clone)]
 pub struct ChunkBlocks {
-    blocks: [[[Option<BlockType>; CHUNK_HEIGHT]; CHUNK_BREADTH]; CHUNK_BREADTH],
+    blocks: [[[Option<BlockType>; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE],
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -38,7 +37,7 @@ enum BiomeType {
 impl ChunkBlocks {
     fn new_empty() -> Self {
         Self {
-            blocks: [[[None; CHUNK_HEIGHT]; CHUNK_BREADTH]; CHUNK_BREADTH],
+            blocks: [[[None; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE],
         }
     }
 
@@ -46,7 +45,7 @@ impl ChunkBlocks {
         let mut chunk = Self::new_empty();
 
         const SEED: u32 = 1;
-        const SEA_LEVEL: f64 = (CHUNK_HEIGHT / 3) as f64;
+        const SEA_LEVEL: f64 = (CHUNK_SIZE / 3) as f64;
         const BASE_HORIZONTAL_SCALE: f64 = 0.01;
 
         const REGION_NOISE_SCALE: f64 = 0.02;
@@ -89,10 +88,10 @@ impl ChunkBlocks {
             .set_lacunarity(2.0)
             .set_persistence(0.5);
 
-        for x in 0..CHUNK_BREADTH {
-            for z in 0..CHUNK_BREADTH {
-                let world_x = coords.0 as f64 * CHUNK_BREADTH as f64 + x as f64;
-                let world_z = coords.1 as f64 * CHUNK_BREADTH as f64 + z as f64;
+        for x in 0..CHUNK_SIZE {
+            for z in 0..CHUNK_SIZE {
+                let world_x = coords.0 as f64 * CHUNK_SIZE as f64 + x as f64;
+                let world_z = coords.1 as f64 * CHUNK_SIZE as f64 + z as f64;
 
                 let region_nx = world_x * REGION_NOISE_SCALE;
                 let region_nz = world_z * REGION_NOISE_SCALE;
@@ -125,7 +124,7 @@ impl ChunkBlocks {
                 let h_modified = h_base * verticality_multiplier;
                 let approx_world_height = SEA_LEVEL + h_modified * current_vertical_scale;
 
-                for y in 0..CHUNK_HEIGHT {
+                for y in 0..CHUNK_SIZE {
                     let world_y = y as f64;
 
                     let base_density = approx_world_height - world_y;
@@ -167,10 +166,10 @@ impl ChunkBlocks {
 
                 let dirt_depth = 3;
 
-                for y in (0..CHUNK_HEIGHT).rev() {
+                for y in (0..CHUNK_SIZE).rev() {
                     let current_block = chunk.blocks[x][z][y];
 
-                    let block_above = if y == CHUNK_HEIGHT - 1 {
+                    let block_above = if y == CHUNK_SIZE - 1 {
                         None
                     } else {
                         chunk.blocks[x][z][y + 1]
@@ -226,16 +225,16 @@ pub struct ChunkNeighborhood {
 impl ChunkNeighborhood {
     #[inline]
     pub fn get_block(&self, gx: i32, gy: i32, gz: i32) -> Option<&BlockType> {
-        if !(0..CHUNK_HEIGHT as i32).contains(&gy) {
+        if !(0..CHUNK_SIZE as i32).contains(&gy) {
             return None;
         }
         let ly = gy as usize;
-        let target_cx = gx.div_euclid(CHUNK_BREADTH as i32);
-        let target_cz = gz.div_euclid(CHUNK_BREADTH as i32);
+        let target_cx = gx.div_euclid(CHUNK_SIZE as i32);
+        let target_cz = gz.div_euclid(CHUNK_SIZE as i32);
         let target_coord = (target_cx, target_cz);
 
-        let lx = gx.rem_euclid(CHUNK_BREADTH as i32) as usize;
-        let lz = gz.rem_euclid(CHUNK_BREADTH as i32) as usize;
+        let lx = gx.rem_euclid(CHUNK_SIZE as i32) as usize;
+        let lz = gz.rem_euclid(CHUNK_SIZE as i32) as usize;
 
         let chunk_data = if target_coord == self.center_coords {
             &self.center
