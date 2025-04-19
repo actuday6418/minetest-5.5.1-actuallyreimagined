@@ -2,7 +2,7 @@ use crate::frustum::{Aabb, Frustum};
 use crate::world::{CHUNK_SIZE, ChunkBlocks, ChunkCoords, World};
 use crate::worldgen::{FaceData, generate_chunk_mesh};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use glam::{Vec2, f32::Vec3};
+use glam::f32::Vec3;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::{
     collections::{HashMap, HashSet},
@@ -34,7 +34,8 @@ enum ChunkState {
 }
 
 pub struct ChunkManager {
-    view_radius: i32,
+    horiz_radius: i32,
+    vert_radius: i32,
     max_uploads_per_frame: usize,
     chunks: HashMap<ChunkCoords, ChunkState>,
     last_camera_chunk_coords: ChunkCoords,
@@ -46,19 +47,33 @@ pub struct ChunkManager {
     mesh_result_sender: Sender<MeshGenResult>,
 }
 
-const DIRECT_NEIGHBOR_OFFSETS: [(i32, i32); 4] = [(0, 1), (0, -1), (1, 0), (-1, 0)];
+const SELF_N_NEIGHBOR_OFFSETS: [(i32, i32, i32); 7] = [
+    (0, 0, 0),  // Self
+    (0, 0, 1),  // North
+    (0, 0, -1), // South
+    (1, 0, 0),  // East
+    (-1, 0, 0), // West
+    (0, 1, 0),  // Up
+    (0, -1, 0), // Down
+];
 
 impl ChunkManager {
-    pub fn new(view_radius: i32, max_uploads_per_frame: usize, world: Arc<RwLock<World>>) -> Self {
+    pub fn new(
+        horiz_radius: i32,
+        vert_radius: i32,
+        max_uploads_per_frame: usize,
+        world: Arc<RwLock<World>>,
+    ) -> Self {
         let thread_pool = Arc::new(ThreadPoolBuilder::new().num_threads(12).build().unwrap());
         let (mesh_result_sender, mesh_result_receiver) = unbounded::<MeshGenResult>();
         let (block_result_sender, block_result_receiver) =
             unbounded::<(ChunkCoords, Arc<ChunkBlocks>)>();
         Self {
-            view_radius,
+            horiz_radius,
+            vert_radius,
             max_uploads_per_frame,
             chunks: HashMap::new(),
-            last_camera_chunk_coords: (i32::MAX, i32::MAX),
+            last_camera_chunk_coords: (i32::MAX, i32::MAX, i32::MAX),
             world,
             thread_pool,
             block_result_receiver,
@@ -85,7 +100,7 @@ impl ChunkManager {
     pub fn get_renderable_chunks<'a>(
         &'a self,
         frustum: &Frustum,
-        camera_pos_xz: Vec2,
+        camera_pos: Vec3,
     ) -> impl Iterator<Item = (ChunkCoords, &'a GpuChunkData, f32)> {
         self.chunks
             .iter()
@@ -102,10 +117,15 @@ impl ChunkManager {
             .map(move |(coords, gpu_data)| {
                 let chunk_center_x =
                     coords.0 as f32 * CHUNK_SIZE as f32 + (CHUNK_SIZE as f32 / 2.0);
-                let chunk_center_z =
+                let chunk_center_y =
                     coords.1 as f32 * CHUNK_SIZE as f32 + (CHUNK_SIZE as f32 / 2.0);
-                let dist_sq =
-                    camera_pos_xz.distance_squared(Vec2::new(chunk_center_x, chunk_center_z));
+                let chunk_center_z =
+                    coords.2 as f32 * CHUNK_SIZE as f32 + (CHUNK_SIZE as f32 / 2.0);
+                let dist_sq = camera_pos.distance_squared(Vec3::new(
+                    chunk_center_x,
+                    chunk_center_y,
+                    chunk_center_z,
+                ));
                 (coords, gpu_data, dist_sq)
             })
     }
@@ -133,13 +153,10 @@ impl ChunkManager {
                     .write()
                     .unwrap()
                     .insert_chunk_blocks(coord, chunk_blocks);
-
                 *state = ChunkState::AwaitingNeighbors;
-
-                self.check_neighbors_and_schedule_mesh(coord);
-
-                for offset in DIRECT_NEIGHBOR_OFFSETS {
-                    let neighbor_coord = (coord.0 + offset.0, coord.1 + offset.1);
+                for offset in SELF_N_NEIGHBOR_OFFSETS {
+                    let neighbor_coord =
+                        (coord.0 + offset.0, coord.1 + offset.1, coord.2 + offset.2);
 
                     if self.chunks.contains_key(&neighbor_coord) {
                         self.check_neighbors_and_schedule_mesh(neighbor_coord);
@@ -170,32 +187,30 @@ impl ChunkManager {
     }
 
     fn check_neighbors_and_schedule_mesh(&mut self, coord: ChunkCoords) {
-        let can_mesh = {
+        let maybe_neighbourhood =
             if !matches!(self.chunks.get(&coord), Some(ChunkState::AwaitingNeighbors)) {
-                false
+                None
             } else {
                 let world_reader = self.world.read().unwrap();
-                DIRECT_NEIGHBOR_OFFSETS.iter().all(|offset| {
-                    let neighbor_coord = (coord.0 + offset.0, coord.1 + offset.1);
+                if SELF_N_NEIGHBOR_OFFSETS.iter().all(|offset| {
+                    let neighbor_coord =
+                        (coord.0 + offset.0, coord.1 + offset.1, coord.2 + offset.2);
                     world_reader.chunk_exists(neighbor_coord)
-                })
-            }
-        };
+                }) {
+                    Some(
+                        world_reader
+                            .get_chunk_neighborhood(coord)
+                            .expect("Neighbors checked but neighborhood fetch failed"),
+                    )
+                } else {
+                    None
+                }
+            };
 
-        if can_mesh {
+        if let Some(neighborhood) = maybe_neighbourhood {
             if let Some(state @ ChunkState::AwaitingNeighbors) = self.chunks.get_mut(&coord) {
                 *state = ChunkState::Meshing;
-
-                let world_arc = self.world.clone();
                 let mesh_sender = self.mesh_result_sender.clone();
-
-                let neighborhood = {
-                    let world_reader = world_arc.read().unwrap();
-                    world_reader
-                        .get_chunk_neighborhood(coord)
-                        .expect("Neighbors checked but neighborhood fetch failed")
-                };
-
                 self.thread_pool.spawn(move || {
                     let faces = generate_chunk_mesh(&neighborhood);
 
@@ -261,13 +276,17 @@ impl ChunkManager {
 
     fn update_chunk_requests(&mut self, camera_chunk_coords: ChunkCoords) {
         let mut required_coords = HashSet::new();
-        for x in
-            (camera_chunk_coords.0 - self.view_radius)..=(camera_chunk_coords.0 + self.view_radius)
+        for x in (camera_chunk_coords.0 - self.horiz_radius)
+            ..=(camera_chunk_coords.0 + self.horiz_radius)
         {
-            for z in (camera_chunk_coords.1 - self.view_radius)
-                ..=(camera_chunk_coords.1 + self.view_radius)
+            for y in (camera_chunk_coords.1 - self.vert_radius)
+                ..=(camera_chunk_coords.1 + self.vert_radius)
             {
-                required_coords.insert((x, z));
+                for z in (camera_chunk_coords.2 - self.horiz_radius)
+                    ..=(camera_chunk_coords.2 + self.horiz_radius)
+                {
+                    required_coords.insert((x, y, z));
+                }
             }
         }
 
@@ -308,6 +327,7 @@ impl ChunkManager {
     fn get_chunk_coords_at(position: Vec3) -> ChunkCoords {
         (
             (position.x / CHUNK_SIZE as f32).floor() as i32,
+            (position.y / CHUNK_SIZE as f32).floor() as i32,
             (position.z / CHUNK_SIZE as f32).floor() as i32,
         )
     }
@@ -315,12 +335,13 @@ impl ChunkManager {
     #[inline]
     fn chunk_aabb_from_coords(coords: ChunkCoords) -> Aabb {
         let chunk_world_x = coords.0 as f32 * CHUNK_SIZE as f32;
-        let chunk_world_z = coords.1 as f32 * CHUNK_SIZE as f32;
+        let chunk_world_y = coords.1 as f32 * CHUNK_SIZE as f32;
+        let chunk_world_z = coords.2 as f32 * CHUNK_SIZE as f32;
         Aabb {
-            min: Vec3::new(chunk_world_x, 0.0, chunk_world_z),
+            min: Vec3::new(chunk_world_x, chunk_world_y, chunk_world_z),
             max: Vec3::new(
                 chunk_world_x + CHUNK_SIZE as f32,
-                CHUNK_SIZE as f32,
+                chunk_world_y + CHUNK_SIZE as f32,
                 chunk_world_z + CHUNK_SIZE as f32,
             ),
         }

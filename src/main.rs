@@ -1,5 +1,5 @@
 use chunk_manager::{ChunkManager, GpuChunkData};
-use glam::{Mat4, Vec2, f32::Vec3};
+use glam::{Mat4, f32::Vec3};
 use std::{
     error::Error,
     path::Path,
@@ -30,6 +30,7 @@ use worldgen::{FaceData, create_quad_templates};
 const MOUSE_SENSITIVITY: f32 = 0.01;
 const MOVE_SPEED: f32 = 0.5;
 const CHUNK_RADIUS: i32 = 10;
+const CHUNK_RADIUS_VERTICAL: i32 = 2;
 const MAX_UPLOADS_PER_FRAME: usize = 20;
 const MSAA_SAMPLES: u32 = 4;
 const MAX_MIP_LEVELS: u32 = 11;
@@ -108,7 +109,12 @@ impl App {
 
         let world = Arc::new(RwLock::new(World::new()));
         let current_frustum = Frustum::from_view_proj(&Mat4::ZERO);
-        let chunk_manager = ChunkManager::new(CHUNK_RADIUS, MAX_UPLOADS_PER_FRAME, world.clone());
+        let chunk_manager = ChunkManager::new(
+            CHUNK_RADIUS,
+            CHUNK_RADIUS_VERTICAL,
+            MAX_UPLOADS_PER_FRAME,
+            world.clone(),
+        );
 
         let app = App {
             wgpu_state: None,
@@ -551,11 +557,9 @@ impl App {
             .queue
             .write_buffer(&state.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-        let camera_pos_xz = Vec2::new(self.camera_position.x, self.camera_position.z);
-
         let mut visible_chunks: Vec<(ChunkCoords, &GpuChunkData, f32)> = self
             .chunk_manager
-            .get_renderable_chunks(&self.current_frustum, camera_pos_xz)
+            .get_renderable_chunks(&self.current_frustum, self.camera_position)
             .collect();
         visible_chunks
             .sort_unstable_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
@@ -618,8 +622,10 @@ impl App {
                 if let Some(face_buffer) = &data.face_buffer {
                     if data.face_count > 0 {
                         let chunk_world_x = chunk_coords.0 as f32 * CHUNK_SIZE as f32;
-                        let chunk_world_z = chunk_coords.1 as f32 * CHUNK_SIZE as f32;
-                        let current_chunk_offset = Vec3::new(chunk_world_x, 0.0, chunk_world_z);
+                        let chunk_world_y = chunk_coords.1 as f32 * CHUNK_SIZE as f32;
+                        let chunk_world_z = chunk_coords.2 as f32 * CHUNK_SIZE as f32;
+                        let current_chunk_offset =
+                            Vec3::new(chunk_world_x, chunk_world_y, chunk_world_z);
 
                         let push_constants = ChunkPushConstants {
                             chunk_offset_world: current_chunk_offset.to_array(),

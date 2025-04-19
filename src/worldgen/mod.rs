@@ -212,16 +212,17 @@ pub fn generate_chunk_mesh(world: &ChunkNeighborhood) -> Vec<FaceData> {
         (0, -1, 0),
     ];
     let chunk_origin_x = chunk_coords.0 * CHUNK_SIZE as i32;
-    let chunk_origin_z = chunk_coords.1 * CHUNK_SIZE as i32;
+    let chunk_origin_y = chunk_coords.1 * CHUNK_SIZE as i32;
+    let chunk_origin_z = chunk_coords.2 * CHUNK_SIZE as i32;
 
     for lx in 0..CHUNK_SIZE {
         for ly in 0..CHUNK_SIZE {
             for lz in 0..CHUNK_SIZE {
-                let block_type = match world.get_block(
-                    chunk_origin_x + lx as i32,
-                    ly as i32,
-                    chunk_origin_z + lz as i32,
-                ) {
+                let gx = chunk_origin_x + lx as i32;
+                let gy = chunk_origin_y + ly as i32;
+                let gz = chunk_origin_z + lz as i32;
+
+                let block_type = match world.get_block(gx, gy, gz) {
                     Some(bt) => bt,
                     None => continue,
                 };
@@ -229,10 +230,6 @@ pub fn generate_chunk_mesh(world: &ChunkNeighborhood) -> Vec<FaceData> {
                 if !block_type.is_opaque() {
                     continue;
                 }
-
-                let gx = chunk_origin_x + lx as i32;
-                let gy = ly as i32;
-                let gz = chunk_origin_z + lz as i32;
 
                 for face_index in 0..6 {
                     let offset = neighbor_offsets[face_index];
