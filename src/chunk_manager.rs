@@ -285,10 +285,22 @@ impl ChunkManager {
                 for z in (camera_chunk_coords.2 - self.horiz_radius)
                     ..=(camera_chunk_coords.2 + self.horiz_radius)
                 {
-                    required_coords.insert((x, y, z));
+                    let dx = x - camera_chunk_coords.0;
+                    let dy = y - camera_chunk_coords.1;
+                    let dz = z - camera_chunk_coords.2;
+
+                    // Normalize distances by radii and check if within unit sphere/ellipsoid
+                    let dist_sq_normalized = (dx as f32 / self.horiz_radius as f32).powi(2) + // X distance normalized by horizontal radius
+    (dy as f32 / self.vert_radius as f32).powi(2) +  // Y distance normalized by vertical radius
+    (dz as f32 / self.horiz_radius as f32).powi(2); // Z distance normalized by horizontal radius
+
+                    if dist_sq_normalized <= 1.0 {
+                        required_coords.insert((x, y, z));
+                    }
                 }
             }
         }
+        println!("{:?}", required_coords);
 
         let current_coords: HashSet<ChunkCoords> = self.chunks.keys().cloned().collect();
 

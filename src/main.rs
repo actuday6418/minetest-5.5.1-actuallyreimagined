@@ -30,7 +30,7 @@ use worldgen::{FaceData, create_quad_templates};
 const MOUSE_SENSITIVITY: f32 = 0.01;
 const MOVE_SPEED: f32 = 0.5;
 const CHUNK_RADIUS: i32 = 10;
-const CHUNK_RADIUS_VERTICAL: i32 = 2;
+const CHUNK_RADIUS_VERTICAL: i32 = 3;
 const MAX_UPLOADS_PER_FRAME: usize = 20;
 const MSAA_SAMPLES: u32 = 4;
 const MAX_MIP_LEVELS: u32 = 11;
