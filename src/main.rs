@@ -19,18 +19,18 @@ use winit::{
 
 mod chunk_manager;
 mod frustum;
+mod meshing;
 mod mipmap;
 mod world;
-mod worldgen;
 
 use frustum::Frustum;
+use meshing::data::{FaceData, create_quad_templates};
 use world::{CHUNK_SIZE, ChunkCoords, World};
-use worldgen::{FaceData, create_quad_templates};
 
 const MOUSE_SENSITIVITY: f32 = 0.01;
 const MOVE_SPEED: f32 = 0.5;
-const CHUNK_RADIUS: i32 = 10;
-const CHUNK_RADIUS_VERTICAL: i32 = 3;
+const CHUNK_RADIUS: i32 = 15;
+const CHUNK_RADIUS_VERTICAL: i32 = 2;
 const MAX_UPLOADS_PER_FRAME: usize = 20;
 const MSAA_SAMPLES: u32 = 4;
 const MAX_MIP_LEVELS: u32 = 11;
@@ -62,7 +62,8 @@ struct WgpuState {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     config: wgpu::SurfaceConfiguration,
-    render_pipeline: wgpu::RenderPipeline,
+    fill_render_pipeline: wgpu::RenderPipeline,
+    line_render_pipeline: wgpu::RenderPipeline,
     texture_bind_group: wgpu::BindGroup,
     uniform_bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
@@ -99,11 +100,12 @@ struct App {
     is_focused: bool,
     move_direction: Vec3,
     current_frustum: Frustum,
+    wiremesh_mode: bool,
 }
 
 impl App {
     async fn new() -> Result<Self, AppError> {
-        let camera_position = Vec3::new(0.0, 0.0, 0.0);
+        let camera_position = Vec3::new(0.0, 512.0, 0.0);
         let yaw: f32 = std::f32::consts::FRAC_PI_2;
         let pitch: f32 = 0.0;
 
@@ -127,6 +129,7 @@ impl App {
             is_focused: false,
             move_direction: Vec3::ZERO,
             current_frustum,
+            wiremesh_mode: false,
         };
 
         Ok(app)
@@ -150,9 +153,9 @@ impl App {
             .await
             .unwrap();
 
-        println!("Using adapter: {:?}", adapter.get_info());
+        log::info!("Using adapter: {:?}", adapter.get_info());
 
-        let required_features = wgpu::Features::PUSH_CONSTANTS;
+        let required_features = wgpu::Features::PUSH_CONSTANTS | wgpu::Features::POLYGON_MODE_LINE;
         let required_limits = wgpu::Limits {
             max_push_constant_size: std::mem::size_of::<ChunkPushConstants>() as u32,
             ..wgpu::Limits::default()
@@ -185,7 +188,7 @@ impl App {
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: wgpu::PresentMode::Mailbox,
+            present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -300,7 +303,7 @@ impl App {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 2,
-                        visibility: wgpu::ShaderStages::VERTEX,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
@@ -366,8 +369,13 @@ impl App {
             }],
         });
 
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
+        let color_target_state = [Some(wgpu::ColorTargetState {
+            format: config.format,
+            blend: Some(wgpu::BlendState::REPLACE),
+            write_mask: wgpu::ColorWrites::ALL,
+        })];
+
+        let base_pipeline_desc = wgpu::RenderPipelineDescriptor {
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -378,11 +386,7 @@ impl App {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &color_target_state,
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
             primitive: wgpu::PrimitiveState {
@@ -390,9 +394,9 @@ impl App {
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: Some(wgpu::Face::Back),
-                polygon_mode: wgpu::PolygonMode::Fill,
                 unclipped_depth: false,
                 conservative: false,
+                ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
@@ -408,7 +412,18 @@ impl App {
             },
             multiview: None,
             cache: None,
-        });
+            label: None,
+        };
+
+        let mut fill_pipeline_desc = base_pipeline_desc.clone();
+        fill_pipeline_desc.label = Some("Fill Render Pipeline");
+        fill_pipeline_desc.primitive.polygon_mode = wgpu::PolygonMode::Fill;
+        let fill_render_pipeline = device.create_render_pipeline(&fill_pipeline_desc);
+
+        let mut line_pipeline_desc = base_pipeline_desc;
+        line_pipeline_desc.label = Some("Line Render Pipeline");
+        line_pipeline_desc.primitive.polygon_mode = wgpu::PolygonMode::Line;
+        let line_render_pipeline = device.create_render_pipeline(&line_pipeline_desc);
 
         let (depth_texture_view, msaa_texture_view) =
             Self::create_size_dependent_textures(&device, &config, MSAA_SAMPLES);
@@ -418,7 +433,8 @@ impl App {
             device,
             queue,
             config,
-            render_pipeline,
+            fill_render_pipeline,
+            line_render_pipeline,
             texture_bind_group,
             uniform_bind_group,
             uniform_buffer,
@@ -610,7 +626,11 @@ impl App {
                 timestamp_writes: None,
             });
 
-            render_pass.set_pipeline(&state.render_pipeline);
+            if self.wiremesh_mode {
+                render_pass.set_pipeline(&state.line_render_pipeline);
+            } else {
+                render_pass.set_pipeline(&state.fill_render_pipeline);
+            }
             render_pass.set_bind_group(0, &state.uniform_bind_group, &[]);
             render_pass.set_bind_group(1, &state.texture_bind_group, &[]);
             render_pass.set_index_buffer(
@@ -730,24 +750,25 @@ impl ApplicationHandler for App {
                         PhysicalKey::Code(KeyCode::KeyW) | PhysicalKey::Code(KeyCode::ArrowUp) => {
                             self.move_direction.z = if is_pressed { 1.0 } else { 0.0 }
                         }
-                        PhysicalKey::Code(KeyCode::KeyS)
-                        | PhysicalKey::Code(KeyCode::ArrowDown) => {
+                        PhysicalKey::Code(KeyCode::KeyS) => {
                             self.move_direction.z = if is_pressed { -1.0 } else { 0.0 }
                         }
-                        PhysicalKey::Code(KeyCode::KeyA)
-                        | PhysicalKey::Code(KeyCode::ArrowLeft) => {
+                        PhysicalKey::Code(KeyCode::KeyA) => {
                             self.move_direction.x = if is_pressed { -1.0 } else { 0.0 }
                         }
-                        PhysicalKey::Code(KeyCode::KeyD)
-                        | PhysicalKey::Code(KeyCode::ArrowRight) => {
+                        PhysicalKey::Code(KeyCode::KeyD) => {
                             self.move_direction.x = if is_pressed { 1.0 } else { 0.0 }
                         }
                         PhysicalKey::Code(KeyCode::Space) => {
                             self.move_direction.y = if is_pressed { 1.0 } else { 0.0 }
                         }
-                        PhysicalKey::Code(KeyCode::ShiftLeft)
-                        | PhysicalKey::Code(KeyCode::ShiftRight) => {
+                        PhysicalKey::Code(KeyCode::ShiftLeft) => {
                             self.move_direction.y = if is_pressed { -1.0 } else { 0.0 }
+                        }
+                        PhysicalKey::Code(KeyCode::KeyM) => {
+                            if is_pressed {
+                                self.wiremesh_mode = !self.wiremesh_mode;
+                            }
                         }
                         _ => {}
                     }

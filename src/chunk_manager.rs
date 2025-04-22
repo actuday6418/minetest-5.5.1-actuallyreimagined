@@ -1,6 +1,7 @@
 use crate::frustum::{Aabb, Frustum};
+use crate::meshing::{build_chunk_mesh, data::FaceData};
 use crate::world::{CHUNK_SIZE, ChunkBlocks, ChunkCoords, World};
-use crate::worldgen::{FaceData, generate_chunk_mesh};
+use crate::{CHUNK_RADIUS, CHUNK_RADIUS_VERTICAL};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use glam::f32::Vec3;
 use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -163,11 +164,6 @@ impl ChunkManager {
                     }
                 }
             } else {
-                log::debug!(
-                    "Received blocks for untracked or unexpected state chunk: {:?}",
-                    coord
-                );
-
                 self.world.write().unwrap().remove_chunk_blocks(&coord);
             }
         }
@@ -177,11 +173,6 @@ impl ChunkManager {
         while let Ok((coord, cpu_mesh_data)) = self.mesh_result_receiver.try_recv() {
             if let Some(state @ ChunkState::Meshing) = self.chunks.get_mut(&coord) {
                 *state = ChunkState::MeshGenerated(cpu_mesh_data);
-            } else {
-                log::debug!(
-                    "Received mesh for untracked or unexpected state chunk: {:?}",
-                    coord
-                );
             }
         }
     }
@@ -212,7 +203,7 @@ impl ChunkManager {
                 *state = ChunkState::Meshing;
                 let mesh_sender = self.mesh_result_sender.clone();
                 self.thread_pool.spawn(move || {
-                    let faces = generate_chunk_mesh(&neighborhood);
+                    let faces = build_chunk_mesh(&neighborhood);
 
                     let cpu_mesh_data = CpuMeshData { faces };
                     if mesh_sender.send((coord, cpu_mesh_data)).is_err() {
@@ -289,18 +280,12 @@ impl ChunkManager {
                     let dy = y - camera_chunk_coords.1;
                     let dz = z - camera_chunk_coords.2;
 
-                    // Normalize distances by radii and check if within unit sphere/ellipsoid
-                    let dist_sq_normalized = (dx as f32 / self.horiz_radius as f32).powi(2) + // X distance normalized by horizontal radius
-    (dy as f32 / self.vert_radius as f32).powi(2) +  // Y distance normalized by vertical radius
-    (dz as f32 / self.horiz_radius as f32).powi(2); // Z distance normalized by horizontal radius
-
-                    if dist_sq_normalized <= 1.0 {
+                    if dx <= CHUNK_RADIUS && dy <= CHUNK_RADIUS_VERTICAL && dz <= CHUNK_RADIUS {
                         required_coords.insert((x, y, z));
                     }
                 }
             }
         }
-        println!("{:?}", required_coords);
 
         let current_coords: HashSet<ChunkCoords> = self.chunks.keys().cloned().collect();
 
@@ -311,7 +296,6 @@ impl ChunkManager {
         {
             let mut world_writer = self.world.write().unwrap();
             for coord in coords_to_unload {
-                log::debug!("Unloading chunk: {:?}", coord);
                 self.chunks.remove(&coord);
                 world_writer.remove_chunk_blocks(&coord);
             }
@@ -322,7 +306,6 @@ impl ChunkManager {
             .cloned()
             .collect();
         for coord in coords_to_load {
-            log::debug!("Requesting chunk: {:?}", coord);
             self.chunks.insert(coord, ChunkState::GeneratingBlocks);
 
             let block_sender = self.block_result_sender.clone();

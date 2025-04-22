@@ -1,4 +1,4 @@
-use crate::world::{BlockType, CHUNK_SIZE, ChunkNeighborhood};
+use crate::world::BlockType;
 use bytemuck::{Pod, Zeroable};
 use glam::{Vec2, Vec3};
 
@@ -23,13 +23,16 @@ pub struct FaceData {
     // 0-7:   Local X position (origin of quad)
     // 8-15:  Local Y position (origin of quad)
     // 16-23: Local Z position (origin of quad)
-    // 24-27: U scale - 1 (Width,  0 -> 1 block, 15 -> 16 blocks)
-    // 28-31: V scale - 1 (Height, 0 -> 1 block, 15 -> 16 blocks)
+    // 24-31: Unused
     //
     // Note: The axis represented by U and V depends on the face normal.
     //  e.g., for +Z face: U=X, V=Y
-    pub packed_data: u32,
-    pub quad_index: u32,
+    pub packed_origin: u32,
+    // Instance data 2: Scale and Quad Index
+    // Bits 0-5:   U scale - 1 (0-63) -> 6 bits
+    // Bits 6-11:  V scale - 1 (0-63) -> 6 bits
+    // Bits 12-31: Quad Index         -> 20 bits (Allows for ~1 million quad templates)
+    pub packed_scale_quad_index: u32,
 }
 
 impl FaceData {
@@ -57,12 +60,12 @@ const STONE_FACE_QUADS_START: u32 = 0;
 const DIRT_FACE_QUADS_START: u32 = 6;
 const GRASS_FACE_QUADS_START: u32 = 12;
 
-fn get_block_face_quad_index(block_type: BlockType, face_index: usize) -> u32 {
+pub fn get_block_face_quad_index(block_type: BlockType, face_index: usize) -> u32 {
     let base = match block_type {
         BlockType::Stone => STONE_FACE_QUADS_START,
         BlockType::Dirt => DIRT_FACE_QUADS_START,
         BlockType::Grass => GRASS_FACE_QUADS_START,
-        BlockType::_Water => panic!("Water should not generate quads"),
+        BlockType::Air => panic!("Water should not generate quads"),
     };
     base + face_index as u32
 }
@@ -99,8 +102,8 @@ pub fn create_quad_templates() -> Vec<QuadTemplateData> {
         grass_side_region,
         grass_side_region,
         grass_side_region,
-        grass_top_region,
         dirt_region,
+        grass_top_region,
     ];
 
     const H: f32 = 0.5;
@@ -196,75 +199,4 @@ fn get_uv_region(tex_x: f32, tex_y: f32) -> [f32; 4] {
     let max_v = (tex_y + TEXTURE_SIZE_PIXELS - 2.0 * TEXTURE_PADDING_PIXELS) / ATLAS_H;
 
     [min_u, min_v, max_u, max_v]
-}
-
-pub fn generate_chunk_mesh(world: &ChunkNeighborhood) -> Vec<FaceData> {
-    let chunk_coords = world.get_center_coords();
-
-    let mut faces = Vec::new();
-
-    let neighbor_offsets: [(i32, i32, i32); 6] = [
-        (0, 0, 1),
-        (0, 0, -1),
-        (-1, 0, 0),
-        (1, 0, 0),
-        (0, 1, 0),
-        (0, -1, 0),
-    ];
-    let chunk_origin_x = chunk_coords.0 * CHUNK_SIZE as i32;
-    let chunk_origin_y = chunk_coords.1 * CHUNK_SIZE as i32;
-    let chunk_origin_z = chunk_coords.2 * CHUNK_SIZE as i32;
-
-    for lx in 0..CHUNK_SIZE {
-        for ly in 0..CHUNK_SIZE {
-            for lz in 0..CHUNK_SIZE {
-                let gx = chunk_origin_x + lx as i32;
-                let gy = chunk_origin_y + ly as i32;
-                let gz = chunk_origin_z + lz as i32;
-
-                let block_type = match world.get_block(gx, gy, gz) {
-                    Some(bt) => bt,
-                    None => continue,
-                };
-
-                if !block_type.is_opaque() {
-                    continue;
-                }
-
-                for face_index in 0..6 {
-                    let offset = neighbor_offsets[face_index];
-                    let neighbor_gx = gx + offset.0;
-                    let neighbor_gy = gy + offset.1;
-                    let neighbor_gz = gz + offset.2;
-
-                    let neighbor_block = world.get_block(neighbor_gx, neighbor_gy, neighbor_gz);
-
-                    let neighbor_is_opaque =
-                        neighbor_block.map_or(false, |neighbor_type| neighbor_type.is_opaque());
-
-                    if !neighbor_is_opaque {
-                        let quad_index = get_block_face_quad_index(*block_type, face_index);
-
-                        let x = lx as u32;
-                        let y = ly as u32;
-                        let z = lz as u32;
-                        let u_scale_minus_1 = 0u32;
-                        let v_scale_minus_1 = 0u32;
-                        let packed_data = x
-                            | (y << 8)
-                            | (z << 16)
-                            | (u_scale_minus_1 << 24)
-                            | (v_scale_minus_1 << 28);
-
-                        faces.push(FaceData {
-                            packed_data,
-                            quad_index,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    faces
 }
