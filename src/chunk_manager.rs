@@ -106,22 +106,19 @@ impl ChunkManager {
     ) -> impl Iterator<Item = (IVec3, &'a GpuChunkData, f32)> {
         self.chunks
             .iter()
-            .filter_map(|(coords, state)| match state {
+            .filter_map(move |(coords, state)| match state {
                 ChunkState::GpuReady(gpu_data) if gpu_data.face_buffer.is_some() => {
-                    Some((*coords, gpu_data))
+                    let aabb = Self::chunk_aabb_from_coords(*coords);
+                    let chunk_center = coords
+                        .as_vec3()
+                        .map(|e| e * CHUNK_SIZE as f32 + (CHUNK_SIZE as f32 / 2.0));
+                    let dist_sq = camera_pos.distance_squared(chunk_center);
+
+                    frustum
+                        .intersects_aabb(&aabb)
+                        .then_some((*coords, gpu_data, dist_sq))
                 }
                 _ => None,
-            })
-            .filter(|(coords, _gpu_data)| {
-                let aabb = Self::chunk_aabb_from_coords(*coords);
-                frustum.intersects_aabb(&aabb)
-            })
-            .map(move |(coords, gpu_data)| {
-                let chunk_center = coords
-                    .as_vec3()
-                    .map(|e| e * CHUNK_SIZE as f32 + (CHUNK_SIZE as f32 / 2.0));
-                let dist_sq = camera_pos.distance_squared(chunk_center);
-                (coords, gpu_data, dist_sq)
             })
     }
 
