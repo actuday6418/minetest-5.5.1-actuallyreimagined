@@ -24,8 +24,9 @@ mod mipmap;
 mod world;
 
 use frustum::Frustum;
+use glam::IVec3;
 use meshing::data::{FaceData, create_quad_templates};
-use world::{CHUNK_SIZE, ChunkCoords, World};
+use world::{CHUNK_SIZE, World};
 
 const MOUSE_SENSITIVITY: f32 = 0.01;
 const MOVE_SPEED: f32 = 0.5;
@@ -573,7 +574,7 @@ impl App {
             .queue
             .write_buffer(&state.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-        let mut visible_chunks: Vec<(ChunkCoords, &GpuChunkData, f32)> = self
+        let mut visible_chunks: Vec<(IVec3, &GpuChunkData, f32)> = self
             .chunk_manager
             .get_renderable_chunks(&self.current_frustum, self.camera_position)
             .collect();
@@ -641,14 +642,11 @@ impl App {
             for (chunk_coords, data, _dist_sq) in visible_chunks {
                 if let Some(face_buffer) = &data.face_buffer {
                     if data.face_count > 0 {
-                        let chunk_world_x = chunk_coords.0 as f32 * CHUNK_SIZE as f32;
-                        let chunk_world_y = chunk_coords.1 as f32 * CHUNK_SIZE as f32;
-                        let chunk_world_z = chunk_coords.2 as f32 * CHUNK_SIZE as f32;
-                        let current_chunk_offset =
-                            Vec3::new(chunk_world_x, chunk_world_y, chunk_world_z);
+                        let chunk_coords_global =
+                            chunk_coords.map(|e| e * CHUNK_SIZE as i32).as_vec3();
 
                         let push_constants = ChunkPushConstants {
-                            chunk_offset_world: current_chunk_offset.to_array(),
+                            chunk_offset_world: chunk_coords_global.to_array(),
                             _padding: 0,
                         };
 

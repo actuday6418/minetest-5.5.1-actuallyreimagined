@@ -1,15 +1,11 @@
-use glam::IVec3;
+use glam::{IVec3, UVec3};
 use std::collections::HashMap;
 
 pub mod data;
 pub mod lod;
 
-use crate::world::{BlockType, ChunkCoords, ChunkNeighborhood};
+use crate::world::{BlockType, ChunkNeighborhood};
 use data::{FaceData, get_block_face_quad_index};
-
-fn chunk_coords_to_ivec3(coords: ChunkCoords) -> IVec3 {
-    IVec3::new(coords.0, coords.1, coords.2)
-}
 
 pub const CHUNK_SIZE: usize = 64;
 pub const CHUNK_SIZE_I32: i32 = CHUNK_SIZE as i32;
@@ -41,8 +37,7 @@ impl FaceDir {
 pub fn build_chunk_mesh(neighborhood: &ChunkNeighborhood) -> Vec<FaceData> {
     let mut faces = Vec::new();
     let chunk = &neighborhood.center;
-    let center_chunk_origin_gs =
-        chunk_coords_to_ivec3(neighborhood.get_center_coords()) * CHUNK_SIZE_I32;
+    let center_chunk_origin_gs = neighborhood.get_center_coords() * CHUNK_SIZE_I32;
     let mut axis_cols: [[[u128; CHUNK_SIZE_P]; CHUNK_SIZE_P]; 3] =
         [[[0; CHUNK_SIZE_P]; CHUNK_SIZE_P]; 3];
     let mut col_face_masks: [[[u128; CHUNK_SIZE_P]; CHUNK_SIZE_P]; 6] =
@@ -67,7 +62,7 @@ pub fn build_chunk_mesh(neighborhood: &ChunkNeighborhood) -> Vec<FaceData> {
         for y in 0..CHUNK_SIZE {
             for x in 0..CHUNK_SIZE {
                 add_voxel_to_axis_cols(
-                    chunk.get_local_block(x, y, z),
+                    chunk.get_local_block(UVec3::new(x as u32, y as u32, z as u32)),
                     x + 1,
                     y + 1,
                     z + 1,
@@ -85,7 +80,7 @@ pub fn build_chunk_mesh(neighborhood: &ChunkNeighborhood) -> Vec<FaceData> {
                     - IVec3::ONE;
                 add_voxel_to_axis_cols(
                     neighborhood
-                        .get_block_from_global_coords(pos.x, pos.y, pos.z)
+                        .get_block_from_global_coords(pos)
                         .unwrap_or_default(),
                     x,
                     y,
@@ -103,7 +98,7 @@ pub fn build_chunk_mesh(neighborhood: &ChunkNeighborhood) -> Vec<FaceData> {
                     - IVec3::ONE;
                 add_voxel_to_axis_cols(
                     neighborhood
-                        .get_block_from_global_coords(pos.x, pos.y, pos.z)
+                        .get_block_from_global_coords(pos)
                         .unwrap_or_default(),
                     x,
                     y,
@@ -121,7 +116,7 @@ pub fn build_chunk_mesh(neighborhood: &ChunkNeighborhood) -> Vec<FaceData> {
                     - IVec3::ONE;
                 add_voxel_to_axis_cols(
                     neighborhood
-                        .get_block_from_global_coords(pos.x, pos.y, pos.z)
+                        .get_block_from_global_coords(pos)
                         .unwrap_or_default(),
                     x,
                     y,
@@ -185,29 +180,25 @@ pub fn build_chunk_mesh(neighborhood: &ChunkNeighborhood) -> Vec<FaceData> {
 
                     let voxel_pos_local = match face_dir {
                         FaceDir::Up => {
-                            IVec3::new(plane_u as i32, slice_coord as i32, plane_v as i32)
+                            UVec3::new(plane_u as u32, slice_coord as u32, plane_v as u32)
                         }
                         FaceDir::Right => {
-                            IVec3::new(slice_coord as i32, plane_u as i32, plane_v as i32)
+                            UVec3::new(slice_coord as u32, plane_u as u32, plane_v as u32)
                         }
                         FaceDir::Back => {
-                            IVec3::new(plane_u as i32, plane_v as i32, slice_coord as i32)
+                            UVec3::new(plane_u as u32, plane_v as u32, slice_coord as u32)
                         }
                         FaceDir::Down => {
-                            IVec3::new(plane_u as i32, slice_coord as i32, plane_v as i32)
+                            UVec3::new(plane_u as u32, slice_coord as u32, plane_v as u32)
                         }
                         FaceDir::Left => {
-                            IVec3::new(slice_coord as i32, plane_u as i32, plane_v as i32)
+                            UVec3::new(slice_coord as u32, plane_u as u32, plane_v as u32)
                         }
                         FaceDir::Forward => {
-                            IVec3::new(plane_u as i32, plane_v as i32, slice_coord as i32)
+                            UVec3::new(plane_u as u32, plane_v as u32, slice_coord as u32)
                         }
                     };
-                    let block_type = neighborhood.center.get_local_block(
-                        voxel_pos_local.x as usize,
-                        voxel_pos_local.y as usize,
-                        voxel_pos_local.z as usize,
-                    );
+                    let block_type = neighborhood.center.get_local_block(voxel_pos_local);
                     let type_map = greedy_data[axis_enum_idx]
                         .entry(block_type as u32)
                         .or_default();

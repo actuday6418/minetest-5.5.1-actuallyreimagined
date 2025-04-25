@@ -1,8 +1,9 @@
+use glam::{IVec3, UVec3, Vec3};
 use noise::{Fbm, MultiFractal, NoiseFn, Perlin};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub type ChunkCoords = (i32, i32, i32);
+use crate::frustum::Aabb;
 
 pub const CHUNK_SIZE: usize = 64;
 
@@ -48,6 +49,16 @@ impl BlockType {
             _ => true,
         }
     }
+
+    pub fn get_collision_aabb(&self) -> Option<Aabb> {
+        match self {
+            BlockType::Air => None,
+            BlockType::Dirt | BlockType::Grass | BlockType::Stone => Some(Aabb {
+                min: Vec3::ZERO,
+                max: Vec3::ONE,
+            }),
+        }
+    }
 }
 
 enum BiomeType {
@@ -63,7 +74,7 @@ impl ChunkBlocks {
         }
     }
 
-    pub fn generate(coords: ChunkCoords) -> Self {
+    pub fn generate(coords: IVec3) -> Self {
         let mut chunk = Self::new_empty();
 
         const SEED: u32 = 1;
@@ -112,8 +123,8 @@ impl ChunkBlocks {
 
         for x in 0..CHUNK_SIZE {
             for z in 0..CHUNK_SIZE {
-                let world_x = coords.0 as f64 * CHUNK_SIZE as f64 + x as f64;
-                let world_z = coords.2 as f64 * CHUNK_SIZE as f64 + z as f64;
+                let world_x = coords.x as f64 * CHUNK_SIZE as f64 + x as f64;
+                let world_z = coords.z as f64 * CHUNK_SIZE as f64 + z as f64;
 
                 let region_nx = world_x * REGION_NOISE_SCALE;
                 let region_nz = world_z * REGION_NOISE_SCALE;
@@ -147,7 +158,7 @@ impl ChunkBlocks {
                 let approx_world_height = SEA_LEVEL + h_modified * current_vertical_scale;
 
                 for y in 0..CHUNK_SIZE {
-                    let world_y = coords.1 as f64 * CHUNK_SIZE as f64 + y as f64;
+                    let world_y = coords.y as f64 * CHUNK_SIZE as f64 + y as f64;
 
                     let base_density = approx_world_height - world_y;
 
@@ -226,14 +237,14 @@ impl ChunkBlocks {
     }
 
     #[inline]
-    pub fn get_local_block(&self, x: usize, y: usize, z: usize) -> BlockType {
-        self.blocks[x][y][z]
+    pub fn get_local_block(&self, coords: UVec3) -> BlockType {
+        self.blocks[coords.x as usize][coords.y as usize][coords.z as usize]
     }
 }
 
 #[derive(Clone)]
 pub struct ChunkNeighborhood {
-    center_coords: ChunkCoords,
+    center_coords: IVec3,
     pub center: Arc<ChunkBlocks>,
     pub north: Arc<ChunkBlocks>,
     pub south: Arc<ChunkBlocks>,
@@ -245,21 +256,15 @@ pub struct ChunkNeighborhood {
 
 impl ChunkNeighborhood {
     #[inline]
-    pub fn get_block_from_global_coords(&self, gx: i32, gy: i32, gz: i32) -> Option<BlockType> {
-        let target_cx = gx.div_euclid(CHUNK_SIZE as i32);
-        let target_cy = gy.div_euclid(CHUNK_SIZE as i32);
-        let target_cz = gz.div_euclid(CHUNK_SIZE as i32);
-        let target_coord = (target_cx, target_cy, target_cz);
+    pub fn get_block_from_global_coords(&self, coord: IVec3) -> Option<BlockType> {
+        let divisor = IVec3::splat(CHUNK_SIZE as i32);
 
-        let lx = gx.rem_euclid(CHUNK_SIZE as i32) as usize;
-        let ly = gy.rem_euclid(CHUNK_SIZE as i32) as usize;
-        let lz = gz.rem_euclid(CHUNK_SIZE as i32) as usize;
+        let target_coord = coord.div_euclid(divisor);
+        let local_coord = coord.rem_euclid(divisor).as_uvec3();
 
-        let dx = target_coord.0 - self.center_coords.0;
-        let dy = target_coord.1 - self.center_coords.1;
-        let dz = target_coord.2 - self.center_coords.2;
+        let dcoords = target_coord - self.center_coords;
 
-        let chunk_data = match (dx, dy, dz) {
+        let chunk_data = match (dcoords.x, dcoords.y, dcoords.z) {
             (0, 0, 0) => &self.center,
             (0, 0, 1) => &self.north,
             (0, 0, -1) => &self.south,
@@ -270,16 +275,16 @@ impl ChunkNeighborhood {
             _ => return None,
         };
 
-        Some(chunk_data.get_local_block(lx, ly, lz))
+        Some(chunk_data.get_local_block(local_coord))
     }
 
-    pub fn get_center_coords(&self) -> ChunkCoords {
+    pub fn get_center_coords(&self) -> IVec3 {
         self.center_coords
     }
 }
 
 pub struct World {
-    chunks: HashMap<ChunkCoords, Arc<ChunkBlocks>>,
+    chunks: HashMap<IVec3, Arc<ChunkBlocks>>,
 }
 
 impl World {
@@ -289,19 +294,19 @@ impl World {
         }
     }
 
-    pub fn insert_chunk_blocks(&mut self, coords: ChunkCoords, blocks: Arc<ChunkBlocks>) {
+    pub fn insert_chunk_blocks(&mut self, coords: IVec3, blocks: Arc<ChunkBlocks>) {
         self.chunks.insert(coords, blocks);
     }
 
-    pub fn remove_chunk_blocks(&mut self, coords: &ChunkCoords) -> Option<Arc<ChunkBlocks>> {
+    pub fn remove_chunk_blocks(&mut self, coords: &IVec3) -> Option<Arc<ChunkBlocks>> {
         self.chunks.remove(coords)
     }
 
-    pub fn chunk_exists(&self, coords: ChunkCoords) -> bool {
+    pub fn chunk_exists(&self, coords: IVec3) -> bool {
         self.chunks.contains_key(&coords)
     }
 
-    pub fn _get_chunk_blocks(&self, coords: ChunkCoords) -> Option<Arc<ChunkBlocks>> {
+    pub fn _get_chunk_blocks(&self, coords: IVec3) -> Option<Arc<ChunkBlocks>> {
         self.chunks.get(&coords).cloned()
     }
 
@@ -312,14 +317,13 @@ impl World {
     /// exist in the world, otherwise returns `None`.
     ///
     /// This should be called *after* verifying that neighbors are ready for meshing.
-    pub fn get_chunk_neighborhood(&self, center_coords: ChunkCoords) -> Option<ChunkNeighborhood> {
-        let (cx, cy, cz) = center_coords;
-        let north_coords = (cx, cy, cz + 1);
-        let south_coords = (cx, cy, cz - 1);
-        let east_coords = (cx + 1, cy, cz);
-        let west_coords = (cx - 1, cy, cz);
-        let up_coords = (cx, cy + 1, cz);
-        let down_coords = (cx, cy - 1, cz);
+    pub fn get_chunk_neighborhood(&self, center_coords: IVec3) -> Option<ChunkNeighborhood> {
+        let north_coords = IVec3::new(center_coords.x, center_coords.y, center_coords.z + 1);
+        let south_coords = IVec3::new(center_coords.x, center_coords.y, center_coords.z - 1);
+        let east_coords = IVec3::new(center_coords.x + 1, center_coords.y, center_coords.z);
+        let west_coords = IVec3::new(center_coords.x - 1, center_coords.y, center_coords.z);
+        let up_coords = IVec3::new(center_coords.x, center_coords.y + 1, center_coords.z);
+        let down_coords = IVec3::new(center_coords.x, center_coords.y - 1, center_coords.z);
 
         let center = self.chunks.get(&center_coords)?;
         let north = self.chunks.get(&north_coords)?;
@@ -339,5 +343,16 @@ impl World {
             up: Arc::clone(up),
             down: Arc::clone(down),
         })
+    }
+
+    pub fn get_block(&self, global_coords: IVec3) -> Option<BlockType> {
+        let divisor = IVec3::splat(CHUNK_SIZE as i32);
+
+        let chunk_coords = global_coords.div_euclid(divisor);
+        let local_coords = global_coords.rem_euclid(divisor).as_uvec3();
+
+        self.chunks
+            .get(&chunk_coords)
+            .map(|chunk| chunk.get_local_block(local_coords))
     }
 }
