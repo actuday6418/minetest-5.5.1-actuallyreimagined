@@ -1,0 +1,21 @@
+[package]
+name = "tester"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+voxel-physics = { path = "../voxel-physics" }
+bytemuck = { version = "1.22", features = ["derive"] }
+crossbeam = "0.8"
+crossbeam-channel = "0.5.15"
+env_logger = "0.11.8"
+glam = "0.30"
+image = { version = "0.25", default-features = false, features = ["png"] }
+log = "0.4.27"
+noise = "0.9"
+pollster = "0.4"
+rayon = "1.10"
+smallvec = "1.15"
+thiserror = "2.0.12"
+wgpu = "25.0"
+winit = "0.30"
