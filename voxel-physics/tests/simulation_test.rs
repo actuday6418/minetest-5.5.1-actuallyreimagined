@@ -5,7 +5,6 @@ const DELTA_TIME: f32 = 1.0 / 60.0;
 const PLAYER_DIMS: Vec3 = Vec3::new(1.0, 2.0, 1.0);
 const PLAYER_HALF_HEIGHT: f32 = PLAYER_DIMS.y * 0.5;
 const PLAYER_HALF_WIDTH: f32 = PLAYER_DIMS.x * 0.5;
-const PLAYER_HALF_DEPTH: f32 = PLAYER_DIMS.z * 0.5;
 
 fn assert_vec3_approx_eq(a: Vec3, b: Vec3, tolerance: f32) {
     assert!(
@@ -182,20 +181,24 @@ fn test_move_freely_horizontally() {
 fn test_start_overlapping_block() {
     let block = AABB::new(Vec3::ZERO, Vec3::ONE);
     let world = MockWorld::new(vec![block]);
-
     let start_pos_y = 1.0 - 0.1 + PLAYER_HALF_HEIGHT;
-    let mut player = PhysicsBody::new(Vec3::new(0.5, start_pos_y, 0.5), PLAYER_DIMS);
-    player.velocity = Vec3::new(0.0, -1.0, 0.0);
+    let start_pos = Vec3::new(0.5, start_pos_y, 0.5);
+    let initial_vel = Vec3::new(0.0, -1.0, 0.0);
+
+    let mut player = PhysicsBody::new(start_pos, PLAYER_DIMS);
+    player.velocity = initial_vel;
 
     step_simulation(&mut player, DELTA_TIME, &world);
 
-    let expected_pos = Vec3::new(0.5, start_pos_y, 0.5);
-
+    let expected_pos = start_pos + initial_vel * DELTA_TIME;
     assert_vec3_approx_eq(player.position, expected_pos, 0.001);
-    assert_eq!(
-        player.velocity.y, 0.0,
-        "Vertical velocity should be zeroed due to overlap"
-    );
 
-    assert!(player.is_grounded, "Player should likely be grounded");
+    assert_eq!(
+        player.velocity, initial_vel,
+        "Velocity should not be zeroed by ignored overlap"
+    );
+    assert!(
+        !player.is_grounded,
+        "Player should not be grounded by ignored overlap"
+    );
 }
